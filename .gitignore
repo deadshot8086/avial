@@ -12,5 +12,11 @@ __pycache__/
 .venv/
 venv/
 
+# Portable-bundle artifacts
+vendor/
+*.tar.gz
+*.tar.xz
+scripts/
+
 # OS artifacts
 .DS_Store

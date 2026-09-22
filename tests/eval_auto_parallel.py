@@ -29,10 +29,10 @@ ROOT = Path(__file__).resolve().parent.parent
 RUN_BENCH = ROOT / "tests" / "run_bench.sh"
 
 # kernels that lower to tasks and have a driver.
-# bicg, symm, trmm, floyd_warshall, trisol, seidel : NO Parallelization so excluded
-# syrk : not supported
-KERNELS = ["gemm", "2mm", "3mm", "syr2k", "mvt", "atax",
-           "jacobi", "jacobi2d", "add2d", "doitgen", "gesummv", "gemver"]
+# "bicg", "floyd_warshall", "seidel", "symm", "trisolv", "trmm" still serial
+KERNELS = ["gemm", "2mm", "3mm", "syr2k", "syrk", "mvt", "atax",
+           "jacobi", "jacobi2d", "add2d", "doitgen", "gesummv", "gemver", "stream6",
+           "bicg", "floyd_warshall", "seidel", "symm", "trisolv", "trmm"]
 
 DEFAULT_RANKS = [1, 2, 4]
 
@@ -40,12 +40,16 @@ RESULT_RE = re.compile(
     r"^RESULT kernel=(\S+) ranks=(\d+) seconds=([\d.]+) status=(\S+) errors=(\d+)")
 
 
-def run_one(kernel, ranks, config, workdir, timeout):
+def run_one(kernel, ranks, config, workdir, timeout, dims=None, size=None):
     cmd = ["bash", str(RUN_BENCH), kernel, str(ranks)]
     if config:
         cmd += ["--config", config]
     if workdir:
         cmd += ["--workdir", workdir]
+    if dims:
+        cmd += ["--dims", dims]
+    if size is not None:
+        cmd += ["--size", str(size)]
 
     started = time.time()
     try:
@@ -72,6 +76,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--kernels", nargs="+", default=KERNELS)
     ap.add_argument("--ranks", nargs="+", type=int, default=DEFAULT_RANKS)
+    ap.add_argument("--dims", default=None,
+                    help="dimension overrides e.g. M=2048,N=2048 or single integer")
+    ap.add_argument("--size", type=int, default=None,
+                    help="symmetric dimension override across all dimensions")
     ap.add_argument("--config", default=None,
                     help="fixed system config; default generates one per rank count")
     ap.add_argument("--workdir", default=None,
@@ -90,7 +98,8 @@ def main():
 
     for kernel in args.kernels:
         for ranks in args.ranks:
-            row = run_one(kernel, ranks, args.config, args.workdir, args.timeout)
+            row = run_one(kernel, ranks, args.config, args.workdir, args.timeout,
+                          dims=args.dims, size=args.size)
             rows.append(row)
 
             secs = f"{row['seconds']:.6f}" if isinstance(row["seconds"], float) else ""

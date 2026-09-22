@@ -61,21 +61,44 @@ static inline float dhir_val(long i) {
     return (float)((i * 1103515245L + 12345L) % 1000) / 1000.0f;
 }
 
-static inline float *dhir_alloc(long n) {
-    float *p = (float *)aligned_alloc(64, ((size_t)n * sizeof(float) + 63) / 64 * 64);
-    if (!p) {
-        fprintf(stderr, "%s: allocation of %ld floats failed\n", DHIR_BENCH_NAME, n);
-        exit(2);
+struct dhir_alloc_proxy {
+    long n;
+    operator float*() const {
+        float *p = (float *)aligned_alloc(64, ((size_t)n * sizeof(float) + 63) / 64 * 64);
+        if (!p) {
+            fprintf(stderr, "%s: allocation of %ld floats failed\n", DHIR_BENCH_NAME, n);
+            exit(2);
+        }
+        return p;
     }
-    return p;
+    operator double*() const {
+        double *p = (double *)aligned_alloc(64, ((size_t)n * sizeof(double) + 63) / 64 * 64);
+        if (!p) {
+            fprintf(stderr, "%s: allocation of %ld doubles failed\n", DHIR_BENCH_NAME, n);
+            exit(2);
+        }
+        return p;
+    }
+};
+
+static inline dhir_alloc_proxy dhir_alloc(long n) {
+    return dhir_alloc_proxy{n};
 }
 
 static inline void dhir_fill(float *p, long n, long seed) {
     for (long i = 0; i < n; ++i) p[i] = dhir_val(i + seed);
 }
 
+static inline void dhir_fill(double *p, long n, long seed) {
+    for (long i = 0; i < n; ++i) p[i] = (double)dhir_val(i + seed);
+}
+
 static inline void dhir_zero(float *p, long n) {
     for (long i = 0; i < n; ++i) p[i] = 0.0f;
+}
+
+static inline void dhir_zero(double *p, long n) {
+    for (long i = 0; i < n; ++i) p[i] = 0.0;
 }
 
 // Relative comparison: these kernels accumulate over up to N terms, so a fixed
@@ -87,6 +110,22 @@ static inline int dhir_compare(const char *what, const float *got,
     for (long i = 0; i < n; ++i) {
         float w = want[i], g = got[i];
         float tol = eps * (std::fabs(w) > 1.0f ? std::fabs(w) : 1.0f);
+        if (!(std::fabs(g - w) <= tol)) {
+            if (errors < 5)
+                printf("  mismatch %s[%ld]: got %.6f want %.6f\n", what, i, g, w);
+            ++errors;
+        }
+    }
+    if (errors > 5) printf("  ... and %d more in %s\n", errors - 5, what);
+    return errors;
+}
+
+static inline int dhir_compare(const char *what, const double *got,
+                               const double *want, long n, double eps) {
+    int errors = 0;
+    for (long i = 0; i < n; ++i) {
+        double w = want[i], g = got[i];
+        double tol = eps * (std::fabs(w) > 1.0 ? std::fabs(w) : 1.0);
         if (!(std::fabs(g - w) <= tol)) {
             if (errors < 5)
                 printf("  mismatch %s[%ld]: got %.6f want %.6f\n", what, i, g, w);

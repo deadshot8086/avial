@@ -130,7 +130,7 @@ python3 "$BENCH/kernels.py" "$KERNEL" "${DIMS_ARGS[@]}" \
 # MPIImplTraits reads the implementation from the module's DLTI spec; attach it
 # to the source, then strip it again before mlir-translate, which rejects it.
 MPI_SPEC='dlti.dl_spec = #dlti.dl_spec<"MPI:Implementation" = "OpenMPI">'
-sed -E "0,/^module[[:space:]]*\{/s//module attributes {$MPI_SPEC} {/" \
+sed -E "0,/^[[:space:]]*module[[:space:]]*\{/s//module attributes {$MPI_SPEC} {/" \
     "$WORKDIR/raw_in.mlir" > "$WORKDIR/in.mlir"
 
 say "dhir-opt"

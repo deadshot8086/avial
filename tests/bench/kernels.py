@@ -54,6 +54,10 @@ SPECS = {
     "syr2k": Spec("kernel_syr2k", ["N", "N", "N", "N", "M"],
                   [("C", ["N", "N"]), ("A", ["N", "M"]), ("B", ["N", "M"])]),
 
+    # C = beta*C + alpha*A*A^T
+    "syrk": Spec("kernel_syrk", [],
+                 [("C", ["N", "N"]), ("A", ["N", "M"])]),
+
     # x1 += A*y1 ; x2 += A^T*y2
     "mvt": Spec("kernel_mvt", ["N", "N", "N", "N"],
                 [("x1", ["N"]), ("x2", ["N"]), ("y1", ["N"]), ("y2", ["N"]),
@@ -97,11 +101,36 @@ SPECS = {
                     [("A", ["M", "N"]), ("B", ["M", "N"]), ("C", ["M", "N"]),
                      ("D", ["M", "N"]), ("E", ["M", "N"]), ("F", ["M", "N"]),
                      ("Out", ["M"])]),
+
+    # s = A^T * r ; q = A * p
+    "bicg": Spec("kernel_bicg", ["M", "N"],
+                 [("A", ["M", "N"]), ("s", ["N"]), ("q", ["M"]),
+                  ("p", ["N"]), ("r", ["M"])]),
+
+    # path[i, j] = min(path[i, j], path[i, k] + path[k, j])
+    "floyd_warshall": Spec("kernel_floyd_warshall", ["N", "N", "N"],
+                           [("path", ["N", "N"])]),
+
+    # T sweeps of a 2-D 9-point Gauss-Seidel stencil over [1, N-1)^2
+    "seidel": Spec("kernel_seidel_2d", ["T", "N", "N"],
+                    [("A", ["N", "N"])], scalars=("T", "N")),
+
+    # C = alpha*A*B + beta*C (A symmetric)
+    "symm": Spec("kernel_symm", ["M", "N"],
+                 [("C", ["M", "N"]), ("A", ["M", "M"]), ("B", ["M", "N"])]),
+
+    # L * x = b (L lower triangular)
+    "trisolv": Spec("kernel_trisolv", ["N"],
+                    [("L", ["N", "N"]), ("x", ["N"]), ("b", ["N"])]),
+
+    # B = alpha * A^T * B (A lower triangular)
+    "trmm": Spec("kernel_trmm", ["M", "N"],
+                 [("A", ["M", "M"]), ("B", ["M", "N"])]),
 }
 
 # Stencils write [1, N-1), so the array is one wider than the loop's upper
 # bound. Everything else has loop bound == dimension.
-STENCIL_UB_IS_N_MINUS_1 = {"jacobi", "jacobi2d"}
+STENCIL_UB_IS_N_MINUS_1 = {"jacobi", "jacobi2d", "seidel"}
 
 
 class Drift(Exception):
@@ -154,6 +183,10 @@ def parse_dims_str(kernel, s):
         for b in spec.bounds:
             if b and b not in spec.scalars:
                 res[b] = val
+        if not res and spec.memrefs:
+            for _, decl in spec.memrefs:
+                for d in decl:
+                    res[d] = val
         return res
 
     out = {}
