@@ -12,6 +12,7 @@
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 
 #include "mlir/Dialect/Index/IR/IndexDialect.h"
+#include "mlir/Dialect/Math/IR/Math.h"
 
 #include "mlir/Transforms/DialectConversion.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
@@ -759,22 +760,46 @@ struct ConvertScheduleOp : public OpConversionPattern<mlir::dhir::ScheduleOp>
                     SmallVector<OpFoldResult> offsets;
                     SmallVector<OpFoldResult> sizes;
                     SmallVector<OpFoldResult> strides;
-                    
+
+                    // A shard whose partition was decided at run time carries
+                    // its (start, end) range as operands; otherwise the range
+                    // is the compile-time attribute as before.
+                    OpFoldResult rangeStart;
+                    OpFoldResult rangeSize;
+                    auto shardRangeOps = taskOp.getRangeOperands();
+                    if (shardRangeOps.size() == 2)
+                    {
+                        // These operands are defined in the schedule body that
+                        // is being replaced, so they must be carried through
+                        // the value mapping into the emitted function.
+                        Value shardStart = mapping.lookupOrDefault(shardRangeOps[0]);
+                        Value shardEnd = mapping.lookupOrDefault(shardRangeOps[1]);
+                        rangeStart = shardStart;
+                        Value spanLen = rewriter.create<arith::SubIOp>(
+                            loc, shardEnd, shardStart);
+                        rangeSize = spanLen;
+                    }
+                    else
+                    {
+                        rangeStart = rewriter.getIndexAttr(outRanges[0]);
+                        rangeSize = rewriter.getIndexAttr(outRanges[1] - outRanges[0]);
+                    }
+
                     if (sourceRank == 1)
                     {
-                        offsets.push_back(rewriter.getIndexAttr(outRanges[0]));
-                        sizes.push_back(rewriter.getIndexAttr(outRanges[1] - outRanges[0]));
+                        offsets.push_back(rangeStart);
+                        sizes.push_back(rangeSize);
                         strides.push_back(rewriter.getIndexAttr(1));
                     }
                     else if (sourceRank == 2)
                     {
                         auto shape = sourceType.getShape();
                         offsets = {
-                            rewriter.getIndexAttr(outRanges[0]),
+                            rangeStart,
                             rewriter.getIndexAttr(0)
                         };
                         sizes = {
-                            rewriter.getIndexAttr((outRanges[1] - outRanges[0])),
+                            rangeSize,
                             rewriter.getIndexAttr(shape[1])
                         };
                         strides = {
@@ -789,12 +814,12 @@ struct ConvertScheduleOp : public OpConversionPattern<mlir::dhir::ScheduleOp>
                         // same pattern used for rank-2 above.
                         auto shape = sourceType.getShape();
                         offsets = {
-                            rewriter.getIndexAttr(outRanges[0]),
+                            rangeStart,
                             rewriter.getIndexAttr(0),
                             rewriter.getIndexAttr(0)
                         };
                         sizes = {
-                            rewriter.getIndexAttr(outRanges[1] - outRanges[0]),
+                            rangeSize,
                             rewriter.getIndexAttr(shape[1]),
                             rewriter.getIndexAttr(shape[2])
                         };
@@ -990,6 +1015,12 @@ namespace mlir
                 target.addLegalDialect<mlir::scf::SCFDialect>();
                 target.addLegalDialect<mlir::memref::MemRefDialect>();
                 target.addLegalDialect<mlir::arith::ArithDialect>();
+                // Kernel bodies carry ops from these dialects unchanged; the
+                // schedule lowering copies them verbatim, so they must be legal
+                // here or an otherwise-correct schedule reports as
+                // "failed to legalize".
+                target.addLegalDialect<mlir::math::MathDialect>();
+                target.addLegalDialect<mlir::index::IndexDialect>();
                 target.addLegalDialect<mlir::LLVM::LLVMDialect>();
                 target.addLegalDialect<mlir::func::FuncDialect>();
                 target.addLegalDialect<mlir::mpi::MPIDialect>();

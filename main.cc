@@ -32,6 +32,7 @@ extern "C" char __libc_single_threaded = 0;
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/GPU/Transforms/Passes.h"
 #include "mlir/Dialect/LLVMIR/NVVMDialect.h"
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 
 #include "conversions/dhirtompi.h"
@@ -54,6 +55,7 @@ extern "C" char __libc_single_threaded = 0;
 #include "mlir/Conversion/UBToLLVM/UBToLLVM.h"
 #include "mlir/Conversion/FuncToLLVM/ConvertFuncToLLVM.h"
 #include "mlir/Conversion/VectorToLLVM/ConvertVectorToLLVM.h"
+#include "mlir/Conversion/MathToLLVM/MathToLLVM.h"
 
 #include "mlir/Conversion/GPUToNVVM/GPUToNVVMPass.h"
 #include "mlir/Conversion/GPUCommon/GPUCommonPass.h"
@@ -146,7 +148,7 @@ int main(int argc, char *argv[])
     llvm::cl::ParseCommandLineOptions(argc, argv, "DHIR OPT Tool\n");
 
     mlir::DialectRegistry registry;
-    registry.insert<mlir::dhir::DhirDialect, mlir::affine::AffineDialect, mlir::memref::MemRefDialect, mlir::func::FuncDialect, mlir::arith::ArithDialect, mlir::scf::SCFDialect, mlir::DLTIDialect, mlir::gpu::GPUDialect>();
+    registry.insert<mlir::dhir::DhirDialect, mlir::affine::AffineDialect, mlir::memref::MemRefDialect, mlir::func::FuncDialect, mlir::arith::ArithDialect, mlir::scf::SCFDialect, mlir::DLTIDialect, mlir::gpu::GPUDialect, mlir::math::MathDialect, mlir::LLVM::LLVMDialect>();
 
     mlir::MLIRContext context(registry);
     context.loadAllAvailableDialects();
@@ -294,6 +296,7 @@ int main(int argc, char *argv[])
         pm.nest<mlir::gpu::GPUModuleOp>().addPass(mlir::memref::createExpandStridedMetadataPass());
         pm.nest<mlir::gpu::GPUModuleOp>().addPass(createConvertGpuOpsToNVVMOps());
         pm.nest<mlir::gpu::GPUModuleOp>().addPass(createArithToLLVMConversionPass());
+        pm.nest<mlir::gpu::GPUModuleOp>().addPass(mlir::createConvertMathToLLVMPass());
         pm.nest<mlir::gpu::GPUModuleOp>().addPass(createConvertIndexToLLVMPass());
         pm.nest<mlir::gpu::GPUModuleOp>().addPass(createUBToLLVMConversionPass());
 
@@ -315,6 +318,7 @@ int main(int argc, char *argv[])
         pm.addPass(createSCFToControlFlowPass());
         pm.addPass(createConvertMPItoLLVM());
         pm.addPass(createArithToLLVMConversionPass());
+        pm.addPass(mlir::createConvertMathToLLVMPass());
         pm.addPass(mlir::createConvertIndexToLLVMPass());
 
         // pm.addPass(createUBToLLVMConversionPass());

@@ -51,14 +51,23 @@ class DhirDialectOp<string mnemonic> : Op<DhirDialect, mnemonic>
 
 def TaskOp : Op<DhirDialect, "task", [AttrSizedOperandSegments, SingleBlockImplicitTerminator<"YieldOp">]>
 {
-  let summary = "Task Operation"; 
+  let summary = "Task Operation";
   let arguments = (
-                   ins AnyAttr : $target,  
+                   ins AnyAttr : $target,
                    Variadic<AnyType>: $inputs,
                    DenseI64ArrayAttr:$inpRanges,
                    Variadic<AnyType>: $outputs,
                    DenseI64ArrayAttr:$outRanges,
-                   Variadic<AnyType>: $actualBuffer
+                   Variadic<AnyType>: $actualBuffer,
+                   // Runtime partition range of this shard, as (start, end) index
+                   // values in the *base* buffer coordinate space.  It is
+                   // populated only when the partitioned loop's trip count is
+                   // not known at compile time; otherwise the compile-time
+                   // inpRanges/outRanges attributes above describe the shard
+                   // and this list stays empty.  Keeping the dynamic case out
+                   // of the attributes is what lets a shard's gather/scatter
+                   // extent be computed at run time.
+                   Variadic<Index>: $rangeOperands
                    );
 
   let results = (outs TaskRef : $result);
@@ -66,6 +75,7 @@ def TaskOp : Op<DhirDialect, "task", [AttrSizedOperandSegments, SingleBlockImpli
 
   let builders = [
     OpBuilder<(ins "TaskRefType":$taskref, "mlir::Attribute":$target, "ValueRange":$inputs, "mlir::DenseI64ArrayAttr":$inpRanges, "ValueRange":$outputs, "mlir::DenseI64ArrayAttr":$outRanges, "ValueRange": $actualBuffer,
+      "ValueRange":$rangeOperands,
       CArg<"function_ref<void(OpBuilder &, Location, Value, ValueRange)>",
            "nullptr">)>
   ];

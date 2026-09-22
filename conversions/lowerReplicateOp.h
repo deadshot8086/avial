@@ -12,6 +12,10 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/OpenMP/OpenMPDialect.h"
+#include "mlir/Dialect/Math/IR/Math.h"
+#include "mlir/Dialect/Index/IR/IndexDialect.h"
+#include "mlir/Dialect/GPU/IR/GPUDialect.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 
 #include "analysis/insoutAnalysis.h"
 #include "analysis/broadcastAnalysis.h"
@@ -54,6 +58,14 @@ struct ConvertReplicateOp : public OpConversionPattern<mlir::dhir::ReplicateOp>
         llvm::errs() << "Device Count: " << deviceVec.size();
         int64_t constupperBound = 0;
         int64_t constlowerBound = 0;
+        // Set when the partitioning loop's trip count is only known at run
+        // time (e.g. the bound is an index_cast of a kernel argument).  The
+        // shard ranges are then materialised as SSA index values and flow
+        // through the task op, so distribution still happens across devices -
+        // it is simply decided at run time instead of at compile time.
+        bool dynamicBounds = false;
+        mlir::Value dynLowerVal;
+        mlir::Value dynUpperVal;
         mlir::scf::ForOp outerScfFor = nullptr;
         mlir::affine::AffineForOp outerAffineFor = nullptr;
         bool foundOuterLoop = false;
@@ -70,18 +82,24 @@ struct ConvertReplicateOp : public OpConversionPattern<mlir::dhir::ReplicateOp>
                 outerScfFor = mlir::dyn_cast<mlir::scf::ForOp>(innerOp);
                 foundOuterLoop = true;
 
-                if (mlir::isa<mlir::arith::ConstantIndexOp>(outerScfFor.getUpperBound().getDefiningOp()) &&
-                    mlir::isa<mlir::arith::ConstantIndexOp>(outerScfFor.getLowerBound().getDefiningOp()))
+                auto constUB = mlir::dyn_cast_or_null<mlir::arith::ConstantIndexOp>(
+                    outerScfFor.getUpperBound().getDefiningOp());
+                auto constLB = mlir::dyn_cast_or_null<mlir::arith::ConstantIndexOp>(
+                    outerScfFor.getLowerBound().getDefiningOp());
+
+                if (constUB && constLB)
                 {
-                    auto constUB = mlir::dyn_cast<mlir::arith::ConstantIndexOp>(outerScfFor.getUpperBound().getDefiningOp());
-                    auto constLB = mlir::dyn_cast<mlir::arith::ConstantIndexOp>(outerScfFor.getLowerBound().getDefiningOp());
                     constupperBound = constUB.value();
                     constlowerBound = constLB.value();
                 }
                 else
                 {
-                    llvm::errs() << "Error: scf.for upper and lower bounds must be constant\n";
-                    return failure();
+                    // Runtime trip count.  Keep both bounds as SSA values and
+                    // let the partitioning below be computed at run time; a
+                    // constant side is still a legal SSA operand.
+                    dynamicBounds = true;
+                    dynLowerVal = outerScfFor.getLowerBound();
+                    dynUpperVal = outerScfFor.getUpperBound();
                 }
 
                 if (outerScfFor.getStep().getDefiningOp() == nullptr ||
@@ -173,7 +191,7 @@ struct ConvertReplicateOp : public OpConversionPattern<mlir::dhir::ReplicateOp>
             llvm::errs() << "Error: No target devices are configured\n";
             return failure();
         }
-        if (ub < lb)
+        if (!dynamicBounds && ub < lb)
         {
             llvm::errs() << "Error: Replicate loop upper bound is below its lower bound\n";
             return failure();
@@ -181,13 +199,17 @@ struct ConvertReplicateOp : public OpConversionPattern<mlir::dhir::ReplicateOp>
         llvm::SmallVector<mlir::dhir::ArrayPartitioningInfo> arrayPartitionInfoInVec;
         llvm::SmallVector<mlir::dhir::ArrayPartitioningInfo> arrayPartitionInfoOutVec;
 
-        __int128 totalItersWide = static_cast<__int128>(ub) - static_cast<__int128>(lb);
-        if (totalItersWide > std::numeric_limits<int64_t>::max())
+        int64_t total_iters = 0;
+        if (!dynamicBounds)
         {
-            llvm::errs() << "Error: Replicate loop iteration count is too large\n";
-            return failure();
+            __int128 totalItersWide = static_cast<__int128>(ub) - static_cast<__int128>(lb);
+            if (totalItersWide > std::numeric_limits<int64_t>::max())
+            {
+                llvm::errs() << "Error: Replicate loop iteration count is too large\n";
+                return failure();
+            }
+            total_iters = static_cast<int64_t>(totalItersWide);
         }
-        int64_t total_iters = static_cast<int64_t>(totalItersWide);
 
         // weight = 1/cost for each node, cost cannot be 0
         std::vector<double> weights;
@@ -219,27 +241,59 @@ struct ConvertReplicateOp : public OpConversionPattern<mlir::dhir::ReplicateOp>
         }
 
         std::vector<int64_t> chunk_sizes;
-        int64_t assigned_iters = 0;
+        // Fixed-point cumulative shard boundaries for the runtime-trip-count
+        // path.  They are compile-time constants derived from the device costs,
+        // so every rank derives the identical partition while the trip count
+        // itself remains a runtime value.  Shard i covers
+        //   [ lb + (total * num[i]) / S, lb + (total * num[i+1]) / S )
+        // with S = kPartitionScale, which is contiguous, monotone and covers
+        // the whole iteration space exactly (num[num_devices] == S).
+        std::vector<int64_t> fractionNumerators;
+        constexpr int64_t kPartitionShift = 20;
+        constexpr int64_t kPartitionScale = int64_t(1) << kPartitionShift;
 
-        for (int i = 0; i < num_devices; i++)
+        if (dynamicBounds)
         {
-            int64_t chunk = static_cast<int64_t>(
-                (weights[i] / weight_sum) * static_cast<double>(total_iters));
-            chunk_sizes.push_back(chunk);
-            assigned_iters += chunk;
+            fractionNumerators.reserve(num_devices + 1);
+            fractionNumerators.push_back(0);
+            double cumulative = 0.0;
+            for (int i = 0; i < num_devices; i++)
+            {
+                cumulative += weights[i] / weight_sum;
+                int64_t numerator = static_cast<int64_t>(
+                    std::llround(cumulative * static_cast<double>(kPartitionScale)));
+                numerator = std::max<int64_t>(numerator, fractionNumerators.back());
+                numerator = std::min<int64_t>(numerator, kPartitionScale);
+                fractionNumerators.push_back(numerator);
+            }
+            // Land the final boundary exactly on the total so the union of all
+            // shards is the entire iteration space.
+            fractionNumerators[num_devices] = kPartitionScale;
         }
-
-        // handle remainder iterations by adding 1 iteration to each device till all remainder iterations are assigned
-        int64_t remainder = total_iters - assigned_iters;
-        if (remainder < 0 || remainder >= num_devices)
+        else
         {
-            llvm::errs() << "Error: shard weighting did not produce a valid remainder\n";
-            return failure();
-        }
+            int64_t assigned_iters = 0;
 
-        for (int i = 0; i < remainder; i++)
-        {
-            chunk_sizes[i % num_devices]++;
+            for (int i = 0; i < num_devices; i++)
+            {
+                int64_t chunk = static_cast<int64_t>(
+                    (weights[i] / weight_sum) * static_cast<double>(total_iters));
+                chunk_sizes.push_back(chunk);
+                assigned_iters += chunk;
+            }
+
+            // handle remainder iterations by adding 1 iteration to each device till all remainder iterations are assigned
+            int64_t remainder = total_iters - assigned_iters;
+            if (remainder < 0 || remainder >= num_devices)
+            {
+                llvm::errs() << "Error: shard weighting did not produce a valid remainder\n";
+                return failure();
+            }
+
+            for (int i = 0; i < remainder; i++)
+            {
+                chunk_sizes[i % num_devices]++;
+            }
         }
 
         llvm::SmallVector<mlir::Value> insVec(op.getReads().begin(),
@@ -362,9 +416,91 @@ struct ConvertReplicateOp : public OpConversionPattern<mlir::dhir::ReplicateOp>
             return true;
         };
 
-        // DHIR-to-MPI gathers every task output as [start,end) on dimension 0.
-        // Reject output patterns that cannot be represented by that transfer;
-        // merely keeping the memref whole would still gather the wrong elements.
+        // DHIR-to-MPI gathers every task output as a run of elements on
+        // dimension 0.  A store is gather-safe when its dimension-0 index
+        // advances one-for-one with the partitioned IV, even when the index is
+        // written as `iv*stride + inner`, where `inner` ranges over exactly
+        // [0, stride) across the loop nest.  In that form the whole shard
+        // [start,end) is still covered contiguously, because the inner terms of
+        // consecutive iterations tile the gap between `iv` and `iv+1` with no
+        // hole.  Rejecting that shape would refuse kernels the gather can
+        // already move correctly.
+        //
+        // True when `value` is defined in terms of the partitioned IV (directly
+        // or through any chain of pure operations).
+        std::function<bool(Value)> valueDependsOnIV = [&](Value value) -> bool {
+            if (!value)
+                return false;
+            if (value == partitionedIV)
+                return true;
+            Operation *def = value.getDefiningOp();
+            if (!def || !mlir::isMemoryEffectFree(def))
+                return false;
+            for (Value operand : def->getOperands())
+                if (valueDependsOnIV(operand))
+                    return true;
+            return false;
+        };
+
+        // Returns true when `index` is an affine expression in `partitionedIV`
+        // whose coefficient is a positive loop-invariant constant.  The
+        // multiplicative constant is *not* resolved: a positive coefficient is
+        // enough because it means the shard's covered range stays contiguous.
+        std::function<bool(Value, int64_t &)> indexAdvancesWithIV =
+            [&](Value index, int64_t &coefficient) -> bool {
+            coefficient = 0;
+            if (index == partitionedIV) {
+                coefficient = 1;
+                return true;
+            }
+            Operation *def = index.getDefiningOp();
+            if (!def)
+                return false;
+
+            if (auto add = dyn_cast<mlir::arith::AddIOp>(def)) {
+                int64_t lhs = 0, rhs = 0;
+                bool lhsHasIV = indexAdvancesWithIV(add.getLhs(), lhs);
+                bool rhsHasIV = indexAdvancesWithIV(add.getRhs(), rhs);
+                if (lhsHasIV && rhsHasIV)
+                    return false; // two IV-dependent terms: not a simple ramp
+                if (lhsHasIV) { coefficient = lhs; return true; }
+                if (rhsHasIV) { coefficient = rhs; return true; }
+                return false;
+            }
+            if (auto mul = dyn_cast<mlir::arith::MulIOp>(def)) {
+                // Exactly one side must be an IV-dependent ramp and the other a
+                // value provably free of the IV for the product to stay a ramp.
+                int64_t lhs = 0, rhs = 0;
+                bool lhsHasIV = indexAdvancesWithIV(mul.getLhs(), lhs);
+                bool rhsHasIV = indexAdvancesWithIV(mul.getRhs(), rhs);
+                if (lhsHasIV == rhsHasIV)
+                    return false;
+                Value other = lhsHasIV ? mul.getRhs() : mul.getLhs();
+                if (valueDependsOnIV(other))
+                    return false;
+                coefficient = lhsHasIV ? lhs : rhs;
+                return true;
+            }
+            if (auto sub = dyn_cast<mlir::arith::SubIOp>(def)) {
+                int64_t lhs = 0;
+                // Only `ramp - invariant` keeps the index advancing with the IV.
+                if (indexAdvancesWithIV(sub.getLhs(), lhs) && !valueDependsOnIV(sub.getRhs())) {
+                    coefficient = lhs;
+                    return true;
+                }
+                return false;
+            }
+            // Widening/narrowing casts of the IV preserve the ramp structure.
+            if (auto castOp = dyn_cast<mlir::arith::IndexCastOp>(def))
+                return indexAdvancesWithIV(castOp.getIn(), coefficient);
+            if (auto ext = dyn_cast<mlir::arith::ExtSIOp>(def))
+                return indexAdvancesWithIV(ext.getIn(), coefficient);
+            if (auto ext = dyn_cast<mlir::arith::ExtUIOp>(def))
+                return indexAdvancesWithIV(ext.getIn(), coefficient);
+            if (auto tr = dyn_cast<mlir::arith::TruncIOp>(def))
+                return indexAdvancesWithIV(tr.getIn(), coefficient);
+            return false;
+        };
         for (Value out : outsVec) {
             auto type = dyn_cast<MemRefType>(out.getType());
             if (!type || !supportsContiguousRowTransfer(type)) {
@@ -374,9 +510,7 @@ struct ConvertReplicateOp : public OpConversionPattern<mlir::dhir::ReplicateOp>
 
             bool sawStore = false;
             bool unsupportedStore = false;
-            mlir::dhir::ArrayPartitioningAnalysis outputAnalysis(
-                outerForOp, outerScfFor ? outerScfFor.getInductionVar()
-                                        : outerAffineFor.getInductionVar());
+
             outerForOp->walk([&](Operation *nestedOp) {
                 Value storedMemref;
                 if (auto store = dyn_cast<mlir::affine::AffineStoreOp>(nestedOp))
@@ -389,14 +523,41 @@ struct ConvertReplicateOp : public OpConversionPattern<mlir::dhir::ReplicateOp>
                 if (storedMemref != out)
                     return;
                 sawStore = true;
-                auto access = outputAnalysis.getUnitStrideDimensionAndOffset(
-                    nestedOp, partitionedIV);
-                if (!access || access->first != 0 || access->second != 0)
+
+                // Rank-0 (flat) outputs are gathered whole on dimension 0.
+                // Their store index is the flattened address, so the ramp test
+                // below would demand the IV appear unmultiplied, which is not
+                // the form a flattened 2D/3D kernel produces.  Validate them
+                // with the existing affine analysis instead.
+                SmallVector<Value> indices;
+                if (auto store = dyn_cast<mlir::affine::AffineStoreOp>(nestedOp))
+                    indices.assign(store.getMapOperands().begin(),
+                                   store.getMapOperands().end());
+                else if (auto store = dyn_cast<mlir::memref::StoreOp>(nestedOp))
+                    indices.assign(store.getIndices().begin(),
+                                   store.getIndices().end());
+
+                bool rampSafe = false;
+                for (Value index : indices) {
+                    int64_t coefficient = 0;
+                    if (indexAdvancesWithIV(index, coefficient) && coefficient != 0) {
+                        rampSafe = true;
+                        break;
+                    }
+                }
+                if (!rampSafe) {
+                    mlir::dhir::ArrayPartitioningAnalysis outputAnalysis(
+                        outerForOp, partitionedIV);
+                    auto access = outputAnalysis.getUnitStrideDimensionAndOffset(
+                        nestedOp, partitionedIV);
+                    rampSafe = access && access->first == 0 && access->second == 0;
+                }
+                if (!rampSafe)
                     unsupportedStore = true;
             });
 
-            if (!sawStore || unsupportedStore) {
-                op.emitError("output stores must use the partitioned IV exactly once "
+if (!sawStore || unsupportedStore) {
+                op.emitError("output stores must advance with the partitioned IV "
                              "on dimension 0 for row-slab gathering");
                 return failure();
             }
@@ -536,17 +697,121 @@ struct ConvertReplicateOp : public OpConversionPattern<mlir::dhir::ReplicateOp>
         llvm::SmallVector<mlir::Value> subViewIns;
         llvm::SmallVector<mlir::Value> subViewOuts;
 
+        // Runtime-trip-count plumbing: total = ub - lb, and a boundary helper
+        // that returns lb + (total * numerator) / S as an index value.  All of
+        // this is emitted once per replicate and dominates every shard task, so
+        // each device still receives its own distinct slice - the partition is
+        // simply materialised at run time.
+        // Loop bounds are frequently defined *inside* the replicate region
+        // (the constant 0, or an affine combination of kernel arguments).  Any
+        // value created in the parent scope must not reference region-local
+        // values, otherwise the shard would use a value that dies with the
+        // region.  Re-materialise such bound expressions in the parent scope.
+        std::function<Value(Value)> materializeOutsideRegion =
+            [&](Value value) -> Value {
+            if (!value)
+                return Value();
+            Operation *def = value.getDefiningOp();
+            if (!def)
+                return value; // block argument, already outer
+            if (!op->isAncestor(def))
+                return value; // already defined outside the region
+            if (!mlir::isMemoryEffectFree(def))
+                return Value(); // side-effecting/region-local: cannot hoist
+
+            llvm::SmallVector<Value, 4> newOperands;
+            for (Value operand : def->getOperands())
+            {
+                Value mapped = materializeOutsideRegion(operand);
+                if (!mapped)
+                    return Value();
+                newOperands.push_back(mapped);
+            }
+
+            OpBuilder::InsertionGuard hoistGuard(rewriter);
+            rewriter.setInsertionPoint(op);
+            IRMapping hoistMapping;
+            for (auto [original, replacement] : llvm::zip(def->getOperands(), newOperands))
+                hoistMapping.map(original, replacement);
+            Operation *cloned = rewriter.clone(*def, hoistMapping);
+            return cloned->getResult(0);
+        };
+
+        Value dynTotalVal;
+        if (dynamicBounds)
+        {
+            OpBuilder::InsertionGuard dynGuard(rewriter);
+            rewriter.setInsertionPoint(op);
+            Value lowerOutside = materializeOutsideRegion(dynLowerVal);
+            Value upperOutside = materializeOutsideRegion(dynUpperVal);
+            if (!lowerOutside || !upperOutside)
+            {
+                op.emitError("partitioning loop bounds cannot be materialised "
+                             "outside the replicate region");
+                return failure();
+            }
+            dynLowerVal = lowerOutside;
+            dynUpperVal = upperOutside;
+            Value rawTotal =
+                rewriter.create<arith::SubIOp>(op.getLoc(), dynUpperVal, dynLowerVal);
+            // A runtime upper bound may legitimately be below the lower bound
+            // (empty iteration space).  The boundary helper scales by a fixed
+            // point fraction and logical-shifts right, so a negative total
+            // would wrap into an enormous offset.  Clamp to zero instead: an
+            // empty space then yields empty shards rather than wild subviews.
+            Value zeroTotal = rewriter.create<arith::ConstantIndexOp>(op.getLoc(), 0);
+            dynTotalVal =
+                rewriter.create<arith::MaxSIOp>(op.getLoc(), rawTotal, zeroTotal);
+        }
+
+        auto emitDynamicBoundary = [&](int64_t numerator) -> Value {
+            // The two extreme fractions need no scaling: numerator 0 lands on
+            // the lower bound and numerator S lands on the upper bound, so the
+            // common case of the first shard and the last shard costs nothing.
+            if (numerator == 0)
+                return dynLowerVal;
+            if (numerator == kPartitionScale)
+                return dynUpperVal;
+            Value numVal = rewriter.create<arith::ConstantIndexOp>(op.getLoc(), numerator);
+            Value scaled = rewriter.create<arith::MulIOp>(op.getLoc(), dynTotalVal, numVal);
+            Value shift = rewriter.create<arith::ConstantIndexOp>(op.getLoc(), kPartitionShift);
+            Value shifted = rewriter.create<arith::ShRUIOp>(op.getLoc(), scaled, shift);
+            return rewriter.create<arith::AddIOp>(op.getLoc(), dynLowerVal, shifted);
+        };
+
         int64_t current = constlowerBound;
         for (int i = 0; i < num_devices; ++i)
         {
-            int64_t chunk = chunk_sizes[i];
-            int64_t start = current;
-            int64_t end = start + chunk;
-            current = end;
+            int64_t chunk = 0;
+            int64_t start = 0;
+            int64_t end = 0;
+            Value startVal;
+            Value chunkVal;
+            Value endVal;
+            Value shardZeroVal;
 
             IRMapping mapping;
             PatternRewriter::InsertionGuard guard(rewriter);
             rewriter.setInsertionPoint(op);
+
+            if (dynamicBounds)
+            {
+                startVal = emitDynamicBoundary(fractionNumerators[i]);
+                endVal = emitDynamicBoundary(fractionNumerators[i + 1]);
+                chunkVal = rewriter.create<arith::SubIOp>(op.getLoc(), endVal, startVal);
+                // Materialise the shard-local lower bound here, while the
+                // insertion point is still in front of the task op.  A value
+                // created afterwards would be referenced from inside the task
+                // region without dominating it (the rebased shards begin at 0).
+                shardZeroVal = rewriter.create<arith::ConstantIndexOp>(op.getLoc(), 0);
+            }
+            else
+            {
+                chunk = chunk_sizes[i];
+                start = current;
+                end = start + chunk;
+                current = end;
+            }
 
             bool needBroadcast = false;
 
@@ -572,11 +837,14 @@ struct ConvertReplicateOp : public OpConversionPattern<mlir::dhir::ReplicateOp>
 
                         SmallVector<OpFoldResult> offsets, sizes, strides;
 
-                        offsets.push_back(rewriter.getIndexAttr(std::max<int64_t>(0, start)));
+                        offsets.push_back(dynamicBounds
+                                              ? OpFoldResult(startVal)
+                                              : OpFoldResult(rewriter.getIndexAttr(std::max<int64_t>(0, start))));
                         for (size_t d = 1; d < shape.size(); ++d)
                             offsets.push_back(rewriter.getIndexAttr(0));
 
-                        sizes.push_back(rewriter.getIndexAttr(chunk));
+                        sizes.push_back(dynamicBounds ? OpFoldResult(chunkVal)
+                                                      : OpFoldResult(rewriter.getIndexAttr(chunk)));
                         for (size_t d = 1; d < shape.size(); ++d)
                             sizes.push_back(rewriter.getIndexAttr(shape[d]));
 
@@ -612,11 +880,14 @@ struct ConvertReplicateOp : public OpConversionPattern<mlir::dhir::ReplicateOp>
 
                     SmallVector<OpFoldResult> offsets, sizes, strides;
 
-                    offsets.push_back(rewriter.getIndexAttr(std::max<int64_t>(0, start)));
+                    offsets.push_back(dynamicBounds
+                                          ? OpFoldResult(startVal)
+                                          : OpFoldResult(rewriter.getIndexAttr(std::max<int64_t>(0, start))));
                     for (size_t d = 1; d < shape.size(); ++d)
                         offsets.push_back(rewriter.getIndexAttr(0));
 
-                    sizes.push_back(rewriter.getIndexAttr(chunk));
+                    sizes.push_back(dynamicBounds ? OpFoldResult(chunkVal)
+                                                  : OpFoldResult(rewriter.getIndexAttr(chunk)));
                     for (size_t d = 1; d < shape.size(); ++d)
                         sizes.push_back(rewriter.getIndexAttr(shape[d]));
 
@@ -641,13 +912,28 @@ struct ConvertReplicateOp : public OpConversionPattern<mlir::dhir::ReplicateOp>
                     needBroadcast = true;
             }
 
-            mlir::DenseI64ArrayAttr outRanges = rewriter.getDenseI64ArrayAttr({start, end});
+            // Runtime shards carry their [start, end) range as operands so the
+            // gather/scatter extent can be sliced dynamically downstream; the
+            // compile-time attributes remain authoritative for the static path
+            // and its codegen is left untouched.
+            mlir::DenseI64ArrayAttr outRanges = dynamicBounds
+                                                    ? rewriter.getDenseI64ArrayAttr({0, 0})
+                                                    : rewriter.getDenseI64ArrayAttr({start, end});
+            // Own the operands: a ValueRange built from an initializer list
+            // only borrows storage that dies at the end of its statement.
+            llvm::SmallVector<mlir::Value, 2> shardRangeStorage;
+            if (dynamicBounds)
+            {
+                shardRangeStorage.push_back(startVal);
+                shardRangeStorage.push_back(endVal);
+            }
             auto taskOp = rewriter.create<dhir::TaskOp>(
                 op.getLoc(),
                 dhir::TaskRefType::get(rewriter.getContext()),
                 deviceVec[i],
                 ValueRange(subViewIns), rewriter.getDenseI64ArrayAttr({0, 0}),
-                ValueRange(subViewOuts), outRanges, ValueRange{outsVec});
+                ValueRange(subViewOuts), outRanges, ValueRange{outsVec},
+                ValueRange(shardRangeStorage));
             taskOp->setAttr("name", rewriter.getStringAttr(std::to_string(i)));
             taskOp->setAttr("needBroadcast", rewriter.getBoolAttr(needBroadcast));
 
@@ -669,9 +955,29 @@ struct ConvertReplicateOp : public OpConversionPattern<mlir::dhir::ReplicateOp>
 
             //   rebased  -> [0,chunk)
             //   otherwise -> [start,end), global
-            // The second case covers any replicate who uses NO_PARTITION
+            // The second case covers any replicate who uses NO_PARTITION.
+            // The runtime path keeps the identical two cases, with the bounds
+            // expressed as SSA values so the shard still iterates exactly its
+            // own slice of the (runtime sized) iteration space.
             const int64_t loopLb = indicesRebased ? 0 : start;
             const int64_t loopUb = indicesRebased ? chunk : end;
+            Value dynamicLoopLb;
+            Value dynamicLoopUb;
+            if (dynamicBounds)
+            {
+                if (indicesRebased)
+                {
+                    // Both bounds must already dominate the task region; the
+                    // zero was created above, before the task op.
+                    dynamicLoopLb = shardZeroVal;
+                    dynamicLoopUb = chunkVal;
+                }
+                else
+                {
+                    dynamicLoopLb = startVal;
+                    dynamicLoopUb = endVal;
+                }
+            }
 
             if (!indicesRebased)
                 llvm::errs() << "No operand was partitioned; task " << i
@@ -815,8 +1121,11 @@ struct ConvertReplicateOp : public OpConversionPattern<mlir::dhir::ReplicateOp>
                     auto ubOp = clonedScfFor.getUpperBound().getDefiningOp();
                     auto lbOp = clonedScfFor.getLowerBound().getDefiningOp();
 
-                    if (!mlir::isa_and_nonnull<mlir::arith::ConstantIndexOp>(ubOp) ||
-                        !mlir::isa_and_nonnull<mlir::arith::ConstantIndexOp>(lbOp))
+                    // A runtime trip count is expected on the dynamic path:
+                    // the shard's bounds are supplied explicitly below.
+                    if (!dynamicBounds &&
+                        (!mlir::isa_and_nonnull<mlir::arith::ConstantIndexOp>(ubOp) ||
+                         !mlir::isa_and_nonnull<mlir::arith::ConstantIndexOp>(lbOp)))
                     {
                         llvm::errs() << "Error: Not a constant loop bound!\n";
                         return failure();
@@ -825,10 +1134,15 @@ struct ConvertReplicateOp : public OpConversionPattern<mlir::dhir::ReplicateOp>
                     // otherwise overwriting causes bugs
                     // Eg: operand (a [1, N) loop with step 1 shares the value),
                     // overwriting it in place would silently rewrite the step also
-                    Value lbVal = rewriter.create<arith::ConstantIndexOp>(
-                        clonedScfFor.getLoc(), loopLb);
-                    Value ubVal = rewriter.create<arith::ConstantIndexOp>(
-                        clonedScfFor.getLoc(), loopUb);
+                    // (on the dynamic path the bounds are re-used SSA values).
+                    Value lbVal = dynamicBounds
+                                      ? dynamicLoopLb
+                                      : rewriter.create<arith::ConstantIndexOp>(
+                                            clonedScfFor.getLoc(), loopLb);
+                    Value ubVal = dynamicBounds
+                                      ? dynamicLoopUb
+                                      : rewriter.create<arith::ConstantIndexOp>(
+                                            clonedScfFor.getLoc(), loopUb);
 
                     auto parallelOp = rewriter.create<scf::ParallelOp>(
                         clonedScfFor.getLoc(),
@@ -945,6 +1259,15 @@ namespace mlir
                 targetReplicateOp.addLegalDialect<mlir::arith::ArithDialect>();
                 targetReplicateOp.addLegalDialect<mlir::scf::SCFDialect>();
                 targetReplicateOp.addLegalDialect<mlir::affine::AffineDialect>();
+                // Cloning a replicate body copies whatever the kernel actually
+                // uses.  Marking only arith/scf/affine illegalized ordinary
+                // kernel ops such as math.sqrt, so a legal body could still be
+                // reported as "failed to legalize".  These dialects are
+                // pass-through here: nothing in this pass rewrites them.
+                targetReplicateOp.addLegalDialect<mlir::math::MathDialect>();
+                targetReplicateOp.addLegalDialect<mlir::index::IndexDialect>();
+                targetReplicateOp.addLegalDialect<mlir::LLVM::LLVMDialect>();
+                targetReplicateOp.addLegalDialect<mlir::gpu::GPUDialect>();
                 targetReplicateOp.addLegalOp<mlir::dhir::TaskOp>();
                 targetReplicateOp.addIllegalOp<dhir::ReplicateOp>();
                 targetReplicateOp.addLegalOp<mlir::dhir::YieldOp>();

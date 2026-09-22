@@ -3,7 +3,7 @@
 using namespace mlir;
 using namespace mlir::dhir;
 
-void mlir::dhir::TaskOp::build(OpBuilder &builder, OperationState &state, TaskRefType resType, mlir::Attribute target, ::mlir::ValueRange inputs, mlir::DenseI64ArrayAttr inpRanges, ::mlir::ValueRange outputs, mlir::DenseI64ArrayAttr outRanges, mlir::ValueRange actualBuffers,
+void mlir::dhir::TaskOp::build(OpBuilder &builder, OperationState &state, TaskRefType resType, mlir::Attribute target, ::mlir::ValueRange inputs, mlir::DenseI64ArrayAttr inpRanges, ::mlir::ValueRange outputs, mlir::DenseI64ArrayAttr outRanges, mlir::ValueRange actualBuffers, ::mlir::ValueRange rangeOperands,
                                 function_ref<void(OpBuilder &, Location, mlir::Value, mlir::ValueRange)> bodyBuilder)
 {
   state.addTypes(resType);
@@ -12,12 +12,18 @@ void mlir::dhir::TaskOp::build(OpBuilder &builder, OperationState &state, TaskRe
 
   state.addAttribute("inpRanges", inpRanges);
   state.addAttribute("outRanges", outRanges);
-  
+
+  // A runtime shard range (start, end) overrides the compile-time range
+  // attributes; the task body still executes on its own device, only the
+  // extent it covers is decided at run time.
+  bool hasDynamicRange = rangeOperands.size() == 2;
 
   state.addOperands(inputs);
   state.addOperands(outputs);
   state.addOperands(actualBuffers);
-  ::llvm::copy(::llvm::ArrayRef<int32_t>({static_cast<int32_t>(inputs.size()), static_cast<int32_t>(outputs.size()), static_cast<int32_t>(actualBuffers.size())}), state.getOrAddProperties<Properties>().operandSegmentSizes.begin());
+  state.addOperands(rangeOperands);
+  ::llvm::copy(::llvm::ArrayRef<int32_t>({static_cast<int32_t>(inputs.size()), static_cast<int32_t>(outputs.size()), static_cast<int32_t>(actualBuffers.size()), static_cast<int32_t>(rangeOperands.size())}), state.getOrAddProperties<Properties>().operandSegmentSizes.begin());
+  (void)hasDynamicRange;
 
   Region *region = state.addRegion();
   Block *block = new Block();

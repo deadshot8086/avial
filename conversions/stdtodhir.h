@@ -88,7 +88,7 @@ struct ConvertToDhir : public OpConversionPattern<mlir::func::FuncOp>
                 auto archVal = rewriter.getStringAttr("sm_61");
                 auto entry1 = mlir::DataLayoutEntryAttr::get(archAttr, archVal);
                 auto targetDlti = mlir::TargetDeviceSpecAttr::get(innerop.getContext(), {entry1});
-                auto taskOp = rewriter.create<dhir::TaskOp>(innerop.getLoc(), dhir::TaskRefType::get(rewriter.getContext()), targetDlti, mlir::ValueRange{},mlir::DenseI64ArrayAttr{}, mlir::ValueRange{}, mlir::DenseI64ArrayAttr{}, mlir::ValueRange{});
+                auto taskOp = rewriter.create<dhir::TaskOp>(innerop.getLoc(), dhir::TaskRefType::get(rewriter.getContext()), targetDlti, mlir::ValueRange{},mlir::DenseI64ArrayAttr{}, mlir::ValueRange{}, mlir::DenseI64ArrayAttr{}, mlir::ValueRange{}, mlir::ValueRange{});
 
                 rewriter.setInsertionPointToStart(&taskOp.getBodyRegion().getBlocks().front());
 
