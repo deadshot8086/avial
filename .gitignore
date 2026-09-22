@@ -20,3 +20,6 @@ scripts/
 
 # OS artifacts
 .DS_Store
+
+tests/rodinia/test_output/
+tests/parboil/test_output/
