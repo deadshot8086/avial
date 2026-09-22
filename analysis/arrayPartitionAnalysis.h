@@ -158,10 +158,8 @@ namespace mlir
                              << ", Is output: " << isOutput
                              << ", Partition dimension: " << partitionDim << "\n";
 
-                // Preserve stencil metadata even though the current lowerer does not
-                // yet materialize halos.
-                if (rank == 1)
-                    computeHaloForAccesses(loads, stores, partitionedIV, info);
+                computeHaloForAccesses(loads, stores, partitionedIV,
+                                       partitionDim, info);
 
                 if (sawUnsupportedIVAccess)
                 {
@@ -179,17 +177,15 @@ namespace mlir
                     info.partitionReason =
                         "inconsistent access dimensions for the partitioned IV";
                 }
-                else if (sawOffsetAccess || info.haloLeft > 0 || info.haloRight > 0)
-                {
-                    info.partitionReason = "halo/stencil access requires deferred halo exchange";
-                }
                 else if (partitionDim == 0)
                 {
                     info.strategy = ArrayPartitioningInfo::ROW_PARTITION;
                     info.partitionDimension = 0;
-                    info.partitionReason = "all accesses use the partitioned IV on dimension 0";
+                    info.partitionReason = sawOffsetAccess
+                        ? "dimension-0 partition with halo exchange"
+                        : "all accesses use the partitioned IV on dimension 0";
                 }
-                else if (partitionDim == 1 && rank == 2)
+                else if (partitionDim == 1 && rank >= 2)
                 {
                     info.strategy = ArrayPartitioningInfo::COL_PARTITION;
                     info.partitionDimension = 1;
@@ -388,6 +384,11 @@ namespace mlir
                 if (!defOp)
                     return false;
 
+                // Stencil indices are often index IVs cast to i32, offset by
+                // +/-1, and cast back; casts preserve the constant displacement.
+                if (auto castOp = dyn_cast<mlir::arith::IndexCastOp>(defOp))
+                    return getOffsetFromIV(castOp.getIn(), targetIV, offset);
+
                 auto getConstant = [](Value value, int64_t &constant) {
                     if (auto constOp = dyn_cast_or_null<mlir::arith::ConstantIndexOp>(
                             value.getDefiningOp()))
@@ -455,9 +456,11 @@ namespace mlir
             // haloRight = max(0,  max_offset)
             void computeHaloForAccesses(llvm::SmallVector<Operation *> &loads,
                                         llvm::SmallVector<Operation *> &stores,
-                                        Value loopIV,
+                                        Value loopIV, int partitionDim,
                                         ArrayPartitioningInfo &info)
             {
+                if (partitionDim < 0)
+                    return;
                 int64_t minOffset = 0;
                 int64_t maxOffset = 0;
                 bool anyFound = false;
@@ -465,7 +468,7 @@ namespace mlir
                 auto processOp = [&](Operation *memOp)
                 {
                     auto access = getUnitStrideDimensionAndOffset(memOp, loopIV);
-                    if (access && access->first == 0)
+                    if (access && access->first == partitionDim)
                     {
                         int64_t offset = access->second;
                         anyFound = true;
@@ -495,11 +498,7 @@ namespace mlir
                     if (info.haloLeft == 0 && info.haloRight == 0)
                         llvm::errs() << "→ No halo needed (accesses match loop IV exactly)\n";
                     else
-                    {
-                        info.strategy = ArrayPartitioningInfo::NO_PARTITION;
                         llvm::errs() << "→ Halo required (stencil pattern detected)\n";
-                        llvm::errs() << "→ No Partition\n";
-                    }
                 }
             }
 

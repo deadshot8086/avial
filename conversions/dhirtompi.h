@@ -472,15 +472,10 @@ struct ConvertScheduleOp : public OpConversionPattern<mlir::dhir::ScheduleOp>
         op.walk([&](mlir::dhir::TaskOp task) {
             for (Operation *ancestor = task->getParentOp(); ancestor && ancestor != op;
                  ancestor = ancestor->getParentOp()) {
-                auto forOp = dyn_cast<mlir::scf::ForOp>(ancestor);
-                if (!forOp) {
+                if (!isa<mlir::scf::ForOp, mlir::scf::IfOp,
+                         mlir::scf::WhileOp>(ancestor)) {
                     task.emitError("task is nested in unsupported control flow; "
-                                   "only scf.for ancestors are supported");
-                    unsupportedTaskNesting = true;
-                    return;
-                }
-                if (!forOp.getInitArgs().empty()) {
-                    task.emitError("task-wrapping scf.for with iter_args is unsupported");
+                                   "expected scf.for/scf.if/scf.while ancestors");
                     unsupportedTaskNesting = true;
                     return;
                 }
@@ -790,6 +785,192 @@ struct ConvertScheduleOp : public OpConversionPattern<mlir::dhir::ScheduleOp>
             // Communication code
             auto tag = rewriter.create<mlir::arith::ConstantOp>(loc, rewriter.getI32Type(), rewriter.getI32IntegerAttr(0));
 
+            auto getTaskNodeIndex = [&](dhir::TaskOp taskOp) -> std::optional<int> {
+                auto it = deviceToIndex.find(taskOp.getTarget());
+                if (it == deviceToIndex.end())
+                    return std::nullopt;
+                return it->second;
+            };
+
+            auto getTaskRange = [&](dhir::TaskOp taskOp) {
+                std::pair<Value, Value> range;
+                auto rangeOperands = taskOp.getRangeOperands();
+                if (rangeOperands.size() == 2)
+                {
+                    range.first = mapping.lookupOrDefault(rangeOperands[0]);
+                    range.second = mapping.lookupOrDefault(rangeOperands[1]);
+                }
+                else
+                {
+                    ArrayRef<int64_t> staticRange = taskOp.getOutRanges();
+                    range.first = rewriter.create<arith::ConstantIndexOp>(
+                        loc, staticRange[0]);
+                    range.second = rewriter.create<arith::ConstantIndexOp>(
+                        loc, staticRange[1]);
+                }
+                return range;
+            };
+
+            auto createAxisSubview = [&](Value buffer, int64_t partitionDim,
+                                         Value start, Value size) -> Value {
+                auto type = cast<MemRefType>(buffer.getType());
+                SmallVector<OpFoldResult> offsets, sizes, strides;
+                for (int64_t d = 0; d < type.getRank(); ++d)
+                {
+                    if (d == partitionDim)
+                    {
+                        offsets.push_back(start);
+                        sizes.push_back(size);
+                    }
+                    else
+                    {
+                        offsets.push_back(rewriter.getIndexAttr(0));
+                        sizes.push_back(type.isDynamicDim(d)
+                            ? OpFoldResult(rewriter.create<memref::DimOp>(
+                                  loc, buffer, d))
+                            : OpFoldResult(rewriter.getIndexAttr(
+                                  type.getDimSize(d))));
+                    }
+                    strides.push_back(rewriter.getIndexAttr(1));
+                }
+                return rewriter.create<memref::SubViewOp>(
+                    loc, buffer, offsets, sizes, strides);
+            };
+
+            auto emitNeighborTransfer = [&](int senderNode, int receiverNode,
+                                            Value sendView, Value recvView) {
+                Value senderIndex = rewriter.create<arith::ConstantIndexOp>(
+                    loc, senderNode);
+                Value receiverIndex = rewriter.create<arith::ConstantIndexOp>(
+                    loc, receiverNode);
+                Value senderRank = rewriter.create<memref::LoadOp>(
+                    loc, nodeToRankMap, ValueRange{senderIndex});
+                Value receiverRank = rewriter.create<memref::LoadOp>(
+                    loc, nodeToRankMap, ValueRange{receiverIndex});
+                Value isSender = rewriter.create<arith::CmpIOp>(
+                    loc, rewriter.getI1Type(), arith::CmpIPredicate::eq,
+                    rank.getResult(0), senderRank);
+                Value isReceiver = rewriter.create<arith::CmpIOp>(
+                    loc, rewriter.getI1Type(), arith::CmpIPredicate::eq,
+                    rank.getResult(0), receiverRank);
+
+                auto ifOp = rewriter.create<scf::IfOp>(
+                    loc, TypeRange{}, isSender, true);
+                ifOp.getThenBodyBuilder(rewriter.getListener())
+                    .create<mpi::SendOp>(loc, retVal, sendView,
+                                         tag.getResult(), receiverRank,
+                                         comm->getResult(0));
+                OpBuilder elseBuilder =
+                    ifOp.getElseBodyBuilder(rewriter.getListener());
+                auto recvIf = elseBuilder.create<scf::IfOp>(
+                    loc, TypeRange{}, isReceiver, true);
+                recvIf.getThenBodyBuilder(elseBuilder.getListener())
+                    .create<mpi::RecvOp>(loc, retVal, recvView,
+                                         tag.getResult(), senderRank,
+                                         comm->getResult(0));
+                (void)recvIf.getElseBodyBuilder(elseBuilder.getListener());
+            };
+
+            // Stencil tasks keep inputs in global coordinates and write only
+            // their owned output slab.  Exchange newly written boundary slabs
+            // with adjacent owners before the gather, as two ordered blocking
+            // handshakes per boundary (avoids send/send deadlock).
+            bool emittedHaloExchange = false;
+            for (TaskOpInfo *rightInfo : level)
+            {
+                auto rightTask = dyn_cast<dhir::TaskOp>(rightInfo->op);
+                if (!rightTask || !rightTask->hasAttr("stencil"))
+                    continue;
+                std::optional<int> rightNode = getTaskNodeIndex(rightTask);
+                if (!rightNode || *rightNode == 0)
+                    continue;
+
+                auto rightRepId = rightTask->getAttrOfType<IntegerAttr>("repId");
+                TaskOpInfo *leftInfo = nullptr;
+                dhir::TaskOp leftTask;
+                for (TaskOpInfo *candidateInfo : level)
+                {
+                    auto candidate = dyn_cast<dhir::TaskOp>(candidateInfo->op);
+                    if (!candidate || !candidate->hasAttr("stencil") ||
+                        candidate->getAttrOfType<IntegerAttr>("repId") != rightRepId)
+                        continue;
+                    std::optional<int> candidateNode = getTaskNodeIndex(candidate);
+                    if (candidateNode && *candidateNode == *rightNode - 1)
+                    {
+                        leftInfo = candidateInfo;
+                        leftTask = candidate;
+                        break;
+                    }
+                }
+                if (!leftInfo)
+                    continue;
+
+                int64_t partitionDim = rightTask
+                    ->getAttrOfType<IntegerAttr>("stencilPartitionDim").getInt();
+                int64_t leftHaloRight = leftTask
+                    ->getAttrOfType<IntegerAttr>("haloRight").getInt();
+                int64_t rightHaloLeft = rightTask
+                    ->getAttrOfType<IntegerAttr>("haloLeft").getInt();
+                auto leftRange = getTaskRange(leftTask);
+                auto rightRange = getTaskRange(rightTask);
+                Value leftChunk = rewriter.create<arith::SubIOp>(
+                    loc, leftRange.second, leftRange.first);
+                Value rightChunk = rewriter.create<arith::SubIOp>(
+                    loc, rightRange.second, rightRange.first);
+
+                size_t outputCount = std::min(leftTask.getActualBuffer().size(),
+                                              rightTask.getActualBuffer().size());
+                auto leftDims = leftTask->getAttrOfType<DenseI64ArrayAttr>(
+                    "outputPartitionDims");
+                auto rightDims = rightTask->getAttrOfType<DenseI64ArrayAttr>(
+                    "outputPartitionDims");
+                for (size_t output = 0; output < outputCount; ++output)
+                {
+                    if (!leftDims || !rightDims ||
+                        leftDims[output] != partitionDim ||
+                        rightDims[output] != partitionDim ||
+                        leftTask.getActualBuffer()[output] !=
+                            rightTask.getActualBuffer()[output])
+                        continue;
+
+                    Value baseBuffer = mapping.lookupOrDefault(
+                        leftTask.getActualBuffer()[output]);
+                    if (rightHaloLeft > 0)
+                    {
+                        Value requested = rewriter.create<arith::ConstantIndexOp>(
+                            loc, rightHaloLeft);
+                        Value width = rewriter.create<arith::MinUIOp>(
+                            loc, requested, leftChunk);
+                        Value start = rewriter.create<arith::SubIOp>(
+                            loc, leftRange.second, width);
+                        Value sendView = createAxisSubview(
+                            baseBuffer, partitionDim, start, width);
+                        Value recvView = createAxisSubview(
+                            baseBuffer, partitionDim, start, width);
+                        emitNeighborTransfer(*rightNode - 1, *rightNode,
+                                             sendView, recvView);
+                        emittedHaloExchange = true;
+                    }
+                    if (leftHaloRight > 0)
+                    {
+                        Value requested = rewriter.create<arith::ConstantIndexOp>(
+                            loc, leftHaloRight);
+                        Value width = rewriter.create<arith::MinUIOp>(
+                            loc, requested, rightChunk);
+                        Value start = rightRange.first;
+                        Value sendView = createAxisSubview(
+                            baseBuffer, partitionDim, start, width);
+                        Value recvView = createAxisSubview(
+                            baseBuffer, partitionDim, start, width);
+                        emitNeighborTransfer(*rightNode, *rightNode - 1,
+                                             sendView, recvView);
+                        emittedHaloExchange = true;
+                    }
+                }
+            }
+            if (emittedHaloExchange)
+                rewriter.create<mpi::Barrier>(loc, retVal, comm->getResult(0));
+
             for (auto task : level)
             {
                 auto taskOp = dyn_cast<mlir::dhir::TaskOp>(task->op);
@@ -859,9 +1040,10 @@ struct ConvertScheduleOp : public OpConversionPattern<mlir::dhir::ScheduleOp>
                         if (targetNodeIdx == 0)
                         {
                             auto copyIf = rewriter.create<mlir::scf::IfOp>(
-                                loc, mlir::TypeRange{}, isReduceRoot, false);
+                                loc, mlir::TypeRange{}, isReduceRoot, true);
                             copyIf.getThenBodyBuilder(rewriter.getListener())
                                 .create<memref::CopyOp>(loc, buffer, actualOut);
+                            (void)copyIf.getElseBodyBuilder(rewriter.getListener());
                         }
                         else
                         {
@@ -884,11 +1066,12 @@ struct ConvertScheduleOp : public OpConversionPattern<mlir::dhir::ScheduleOp>
 
                             OpBuilder elseBuilder = recvIf.getElseBodyBuilder(rewriter.getListener());
                             auto sendIf = elseBuilder.create<mlir::scf::IfOp>(
-                                loc, mlir::TypeRange{}, isReduceOwner, false);
+                                loc, mlir::TypeRange{}, isReduceOwner, true);
                             sendIf.getThenBodyBuilder(elseBuilder.getListener())
                                 .create<mlir::mpi::SendOp>(
                                     loc, retVal, buffer, tag.getResult(),
                                     reduceRootRank, comm->getResult(0));
+                            (void)sendIf.getElseBodyBuilder(elseBuilder.getListener());
                         }
 
                         BoolAttr reduceBroadcast =
@@ -991,15 +1174,20 @@ struct ConvertScheduleOp : public OpConversionPattern<mlir::dhir::ScheduleOp>
 
                         thenBuilder.create<mlir::mpi::RecvOp>(loc, retVal, subBuffer, tag.getResult(), ownerRank, comm->getResult(0));
 
-                        auto sendIf = elseBuilder.create<mlir::scf::IfOp>(loc, mlir::TypeRange{}, isOwner, false);
+                        auto sendIf = elseBuilder.create<mlir::scf::IfOp>(loc, mlir::TypeRange{}, isOwner, true);
                         auto sendBuilder = sendIf.getThenBodyBuilder(elseBuilder.getListener());
                         sendBuilder.create<mlir::mpi::SendOp>(loc, retVal, subBuffer, tag.getResult(), rootRank, comm->getResult(0));
+                        (void)sendIf.getElseBodyBuilder(elseBuilder.getListener());
                     }
 
                     // Broadcast
                     BoolAttr needBroadcast = mlir::dyn_cast<mlir::BoolAttr>(taskOp->getAttr("needBroadcast"));
                     if (needBroadcast && needBroadcast.getValue())
-                        toBroadcast.push_back(subBuffer);
+                        // Broadcast the assembled base allocation, never a
+                        // shard view: shard views lose the partition axis and
+                        // cannot be concatenated for column/higher-rank
+                        // partitions.
+                        toBroadcast.push_back(sourceBuffer);
                 }
             }
 
@@ -1032,8 +1220,12 @@ struct ConvertScheduleOp : public OpConversionPattern<mlir::dhir::ScheduleOp>
         {
             for (Operation &bodyOp : body)
             {
+                // Terminators are re-created by their own handlers
+                // (scf.for/scf.if yields, scf.while conditions); cloning them
+                // here would leave the rebuilt block with two terminators.
                 if (mlir::isa<mlir::dhir::YieldOp>(bodyOp) ||
-                    mlir::isa<mlir::scf::YieldOp>(bodyOp))
+                    mlir::isa<mlir::scf::YieldOp>(bodyOp) ||
+                    mlir::isa<mlir::scf::ConditionOp>(bodyOp))
                     continue;
 
                 if (mlir::isa<mlir::dhir::TaskOp>(bodyOp))
@@ -1079,19 +1271,186 @@ struct ConvertScheduleOp : public OpConversionPattern<mlir::dhir::ScheduleOp>
                         Value ub = mapping.lookupOrDefault(forOp.getUpperBound());
                         Value step = mapping.lookupOrDefault(forOp.getStep());
 
-                        auto newForOp = rewriter.create<mlir::scf::ForOp>(loc, lb, ub, step);
-                        mapping.map(forOp.getInductionVar(), newForOp.getInductionVar());
+                        SmallVector<Value> initArgs;
+                        for (Value init : forOp.getInitArgs())
+                            initArgs.push_back(mapping.lookupOrDefault(init));
+                        auto newForOp = rewriter.create<mlir::scf::ForOp>(
+                            loc, lb, ub, step, initArgs,
+                            [&](OpBuilder &bodyBuilder, Location bodyLoc,
+                                Value newIV, ValueRange newIterArgs) {
+                                mapping.map(forOp.getInductionVar(), newIV);
+                                for (auto pair : llvm::zip(
+                                         forOp.getRegionIterArgs(), newIterArgs))
+                                    mapping.map(std::get<0>(pair), std::get<1>(pair));
 
-                        rewriter.setInsertionPoint(newForOp.getBody()->getTerminator());
+                                rewriter.setInsertionPointToEnd(
+                                    bodyBuilder.getInsertionBlock());
+                                if (failed(emitBody(*forOp.getBody())))
+                                    return;
 
-                        if (failed(emitBody(*forOp.getBody())))
-                            return failure();
+                                auto oldYield = cast<mlir::scf::YieldOp>(
+                                    forOp.getBody()->getTerminator());
+                                SmallVector<Value> yieldValues;
+                                for (Value value : oldYield.getOperands())
+                                    yieldValues.push_back(
+                                        mapping.lookupOrDefault(value));
+                                rewriter.setInsertionPointToEnd(
+                                    bodyBuilder.getInsertionBlock());
+                                rewriter.create<mlir::scf::YieldOp>(bodyLoc,
+                                                                     yieldValues);
+                            },
+                            forOp.getUnsignedCmp());
+                        for (auto pair : llvm::zip(forOp.getResults(),
+                                                  newForOp.getResults()))
+                            mapping.map(std::get<0>(pair), std::get<1>(pair));
 
                         rewriter.setInsertionPointAfter(newForOp.getOperation());
                         continue;
                     }
                     // A loop with no tasks is redundant work that every rank
                     // repeats; clone it where it stands.
+                }
+
+                if (auto ifOp = mlir::dyn_cast<mlir::scf::IfOp>(bodyOp))
+                {
+                    bool wrapsTasks = false;
+                    ifOp.walk([&](mlir::dhir::TaskOp) { wrapsTasks = true; });
+                    if (wrapsTasks)
+                    {
+                        Value condition = mapping.lookupOrDefault(ifOp.getCondition());
+                        bool hasElse = !ifOp.getElseRegion().empty();
+                        // A result-producing scf.if needs an else region to
+                        // reconstruct; without one the rebuilt op would fail
+                        // obscurely in the verifier — reject it clearly.
+                        if (!ifOp.getResultTypes().empty() && !hasElse)
+                        {
+                            ifOp.emitError(
+                                "scf.if that wraps tasks produces results but has "
+                                "no else region; unsupported");
+                            return failure();
+                        }
+                        auto newIfOp = rewriter.create<mlir::scf::IfOp>(
+                            loc, ifOp.getResultTypes(), condition, true, hasElse);
+
+                        auto rebuildBranch = [&](Block &oldBlock,
+                                                 Block &newBlock) -> LogicalResult {
+                            rewriter.setInsertionPointToStart(&newBlock);
+                            if (failed(emitBody(oldBlock)))
+                                return failure();
+                            auto oldYield = cast<mlir::scf::YieldOp>(
+                                oldBlock.getTerminator());
+                            SmallVector<Value> yieldValues;
+                            for (Value value : oldYield.getOperands())
+                                yieldValues.push_back(mapping.lookupOrDefault(value));
+                            if (auto existing = dyn_cast_or_null<mlir::scf::YieldOp>(
+                                    newBlock.getTerminator()))
+                            {
+                                existing->setOperands(yieldValues);
+                            }
+                            else
+                            {
+                                // IfOp's block-creating builder leaves fresh
+                                // regions unterminated, and emitBody may end in
+                                // a collective or an empty branch, so never
+                                // assume a source yield was cloned.
+                                rewriter.setInsertionPointToEnd(&newBlock);
+                                rewriter.create<mlir::scf::YieldOp>(loc,
+                                                                     yieldValues);
+                            }
+                            return success();
+                        };
+
+                        if (failed(rebuildBranch(ifOp.getThenRegion().front(),
+                                                 newIfOp.getThenRegion().front())))
+                            return failure();
+                        if (hasElse &&
+                            failed(rebuildBranch(ifOp.getElseRegion().front(),
+                                                 newIfOp.getElseRegion().front())))
+                            return failure();
+                        for (auto pair : llvm::zip(ifOp.getResults(),
+                                                  newIfOp.getResults()))
+                            mapping.map(std::get<0>(pair), std::get<1>(pair));
+                        rewriter.setInsertionPointAfter(newIfOp);
+                        continue;
+                    }
+                }
+
+                if (auto whileOp = mlir::dyn_cast<mlir::scf::WhileOp>(bodyOp))
+                {
+                    bool wrapsTasks = false;
+                    whileOp.walk([&](mlir::dhir::TaskOp) { wrapsTasks = true; });
+                    if (wrapsTasks)
+                    {
+                        SmallVector<Value> inits;
+                        for (Value init : whileOp.getInits())
+                            inits.push_back(mapping.lookupOrDefault(init));
+                        auto newWhileOp = rewriter.create<mlir::scf::WhileOp>(
+                            loc, whileOp.getResultTypes(), inits,
+                            ArrayRef<NamedAttribute>{});
+
+                        Block *newBefore = rewriter.createBlock(
+                            &newWhileOp.getBefore(), {},
+                            whileOp.getBeforeBody()->getArgumentTypes(),
+                            SmallVector<Location>(
+                                whileOp.getBeforeBody()->getNumArguments(), loc));
+                        Block *newAfter = rewriter.createBlock(
+                            &newWhileOp.getAfter(), {},
+                            whileOp.getAfterBody()->getArgumentTypes(),
+                            SmallVector<Location>(
+                                whileOp.getAfterBody()->getNumArguments(), loc));
+                        for (auto pair : llvm::zip(
+                                 whileOp.getBeforeBody()->getArguments(),
+                                 newBefore->getArguments()))
+                            mapping.map(std::get<0>(pair), std::get<1>(pair));
+                        for (auto pair : llvm::zip(
+                                 whileOp.getAfterBody()->getArguments(),
+                                 newAfter->getArguments()))
+                            mapping.map(std::get<0>(pair), std::get<1>(pair));
+
+                        rewriter.setInsertionPointToStart(newBefore);
+                        if (failed(emitBody(*whileOp.getBeforeBody())))
+                            return failure();
+                        auto oldCondition = whileOp.getConditionOp();
+                        SmallVector<Value> conditionArgs;
+                        for (Value value : oldCondition.getArgs())
+                            conditionArgs.push_back(mapping.lookupOrDefault(value));
+                        rewriter.setInsertionPointToEnd(newBefore);
+                        rewriter.create<mlir::scf::ConditionOp>(
+                            loc, mapping.lookupOrDefault(oldCondition.getCondition()),
+                            conditionArgs);
+
+                        rewriter.setInsertionPointToStart(newAfter);
+                        if (failed(emitBody(*whileOp.getAfterBody())))
+                            return failure();
+                        auto oldYield = whileOp.getYieldOp();
+                        SmallVector<Value> yieldValues;
+                        for (Value value : oldYield.getOperands())
+                            yieldValues.push_back(mapping.lookupOrDefault(value));
+                        rewriter.setInsertionPointToEnd(newAfter);
+                        rewriter.create<mlir::scf::YieldOp>(loc, yieldValues);
+
+                        for (auto pair : llvm::zip(whileOp.getResults(),
+                                                  newWhileOp.getResults()))
+                            mapping.map(std::get<0>(pair), std::get<1>(pair));
+                        rewriter.setInsertionPointAfter(newWhileOp);
+                        continue;
+                    }
+                }
+
+                // Fallback: an ordinary op with no tasks is cloned verbatim.
+                // A task still inside means the dispatch above cannot rebuild
+                // it (only scf.for/scf.if/scf.while are handled); fail with a
+                // clear error at the offending op instead of cloning an
+                // unconverted dhir.task.
+                bool clonesTask = false;
+                bodyOp.walk([&](mlir::dhir::TaskOp) { clonesTask = true; });
+                if (clonesTask)
+                {
+                    bodyOp.emitError(
+                        "task is wrapped in a construct the dhir-to-mpi rebuild "
+                        "cannot reconstruct; only scf.for/scf.if/scf.while may "
+                        "wrap tasks");
+                    return failure();
                 }
 
                 cloneAndMapResults(rewriter, bodyOp, mapping);

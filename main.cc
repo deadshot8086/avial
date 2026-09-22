@@ -301,6 +301,9 @@ int main(int argc, char *argv[])
         pm.nest<mlir::gpu::GPUModuleOp>().addPass(createUBToLLVMConversionPass());
 
         // Multi-Core Related Passes
+        // Replicate lowering introduces affine.apply while rebasing dynamic
+        // shards; lower it before the code enters omp regions.
+        pm.addPass(mlir::createLowerAffinePass());
         pm.addPass(mlir::createConvertSCFToOpenMPPass());
     }
 
@@ -312,9 +315,10 @@ int main(int argc, char *argv[])
         pm.addPass(createGpuToLLVMConversionPass());
 
         pm.addPass(createConvertNVVMToLLVMPass());
-        // pm.addPass(mlir::createLowerAffinePass());
-
         pm.addPass(mlir::memref::createExpandStridedMetadataPass());
+        // expand-strided-metadata materializes dynamic offset/stride products
+        // as affine.apply; lower them before Func/MemRef conversion.
+        pm.addPass(mlir::createLowerAffinePass());
         pm.addPass(createSCFToControlFlowPass());
         pm.addPass(createConvertMPItoLLVM());
         pm.addPass(createArithToLLVMConversionPass());

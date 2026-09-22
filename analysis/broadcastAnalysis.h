@@ -81,10 +81,12 @@ namespace mlir
                     llvm::errs() << "  Found " << subsequentReplicates.size() 
                                 << " subsequent replicate(s)\n";
 
-                    // Every later consumer must be able to see the producer's
-                    // data. A single NO_PARTITION consumer requires broadcast,
-                    // even if an earlier consumer is row-partitioned.
-                    bool needsAnyBroadcast = false;
+                    // A consumer's partitioning strategy does not prove the
+                    // producer used the same shard ranges or axis, so keeping
+                    // the producer distributed is unsound: materialize its
+                    // assembled output for every subsequent consumer.  A
+                    // contract-aware analysis can relax this later.
+                    bool needsAnyBroadcast = !subsequentReplicates.empty();
                     ArrayPartitioningInfo firstPartInfo{};
                     bool havePartInfo = false;
                     for (mlir::Operation *nextReplicate : subsequentReplicates)
@@ -103,19 +105,11 @@ namespace mlir
 
                     if (needsAnyBroadcast) {
                         info.needsBroadcast = true;
-                        info.reason = "A subsequent replicate needs NO_PARTITION (replicate/broadcast)";
+                        info.reason = "producer/consumer shard contract is not proven; materialize output";
                         llvm::errs() << "  ✓ BROADCAST NEEDED: " << info.reason << "\n";
                     } else {
                         info.needsBroadcast = false;
-                        
-                        if (firstPartInfo.strategy == ArrayPartitioningInfo::ROW_PARTITION) {
-                            info.reason = "Subsequent replicate uses ROW_PARTITION (no broadcast)";
-                        } else if (firstPartInfo.strategy == ArrayPartitioningInfo::COL_PARTITION) {
-                            info.reason = "Subsequent replicate uses COL_PARTITION (no broadcast)";
-                        } else {
-                            info.reason = "Partitioning strategy allows direct usage";
-                        }
-                        
+                        info.reason = "No subsequent consumer";
                         llvm::errs() << "  ✗ NO BROADCAST: " << info.reason << "\n";
                     }
 
@@ -164,8 +158,8 @@ namespace mlir
                     if (replicateOp->isProperAncestor(op.getOperation()))
                         return;
 
-                    // Check if this operation is a replicate that reads our memref
-                    if (isReadByReplicate(op, memref)) {
+                    // Check if this operation is a replicate that consumes our memref
+                    if (isConsumedByReplicate(op, memref)) {
                         result.push_back(op);
                     }
                 });
@@ -173,14 +167,25 @@ namespace mlir
                 return result;
             }
 
-            // Check if a memref is read by a replicate operation
-            bool isReadByReplicate(mlir::Operation *replicate, Value memref)
+            // Does a later replicate consume `memref` — as a read OR a write?
+            //
+            // An in-place reduction records its accumulator as a write with
+            // zero reads (read-modify-write, e.g. sad's second stage), yet it
+            // still needs the producer's complete output.  Treating writes as
+            // consumption is conservative: it only costs a redundant transfer,
+            // never correctness.
+            bool isConsumedByReplicate(mlir::Operation *replicate, Value memref)
             {
-                llvm::SmallVector<Value> readArgs = mlir::dyn_cast<mlir::dhir::ReplicateOp>(replicate).getReads(); 
-                for (Value readArg : readArgs) {
-                    if (readArg == memref) {
+                auto rep = mlir::dyn_cast<mlir::dhir::ReplicateOp>(replicate);
+                if (!rep)
+                    return false;
+                for (Value readArg : rep.getReads()) {
+                    if (readArg == memref)
                         return true;
-                    }
+                }
+                for (Value writeArg : rep.getWrites()) {
+                    if (writeArg == memref)
+                        return true;
                 }
                 return false;
             }

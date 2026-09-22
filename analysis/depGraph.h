@@ -259,20 +259,19 @@ namespace mlir
               continue;
             }
 
-            if (auto forOp = mlir::dyn_cast<mlir::scf::ForOp>(bodyOp))
+            bool wrapsTasks = false;
+            bodyOp.walk([&](mlir::dhir::TaskOp) { wrapsTasks = true; });
+            if (wrapsTasks && bodyOp.getNumRegions() != 0)
             {
-              bool wrapsTasks = false;
-              forOp.walk([&](mlir::dhir::TaskOp) { wrapsTasks = true; });
-              if (wrapsTasks)
-              {
-                activeGroup.reset();
-                assignEmissionGroups(*forOp.getBody());
-                activeGroup.reset();
-                continue;
-              }
+              activeGroup.reset();
+              for (mlir::Region &region : bodyOp.getRegions())
+                for (mlir::Block &nestedBlock : region)
+                  assignEmissionGroups(nestedBlock);
+              activeGroup.reset();
+              continue;
             }
 
-            // Serial work and unsupported control flow are ordering barriers.
+            // Serial work and region boundaries are ordering barriers.
             activeGroup.reset();
           }
         };

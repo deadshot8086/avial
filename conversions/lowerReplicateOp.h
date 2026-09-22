@@ -374,6 +374,29 @@ struct ConvertReplicateOp : public OpConversionPattern<mlir::dhir::ReplicateOp>
             llvm::errs() << "Warning: No for loop found in schedule body\n";
         }
 
+        int64_t stencilPartitionDim = -1;
+        int64_t stencilHaloLeft = 0;
+        int64_t stencilHaloRight = 0;
+        auto collectHalo = [&](const auto &info) {
+            if (info.haloLeft == 0 && info.haloRight == 0)
+                return;
+            if (stencilPartitionDim < 0)
+                stencilPartitionDim = info.partitionDimension;
+            else if (stencilPartitionDim != info.partitionDimension)
+                stencilPartitionDim = -2;
+            stencilHaloLeft = std::max<int64_t>(stencilHaloLeft, info.haloLeft);
+            stencilHaloRight = std::max<int64_t>(stencilHaloRight, info.haloRight);
+        };
+        for (const auto &info : arrayPartitionInfoInVec)
+            collectHalo(info);
+        for (const auto &info : arrayPartitionInfoOutVec)
+            collectHalo(info);
+        if (isStencil && stencilPartitionDim == -2)
+        {
+            op.emitError("stencil operands require halos on inconsistent dimensions");
+            return failure();
+        }
+
         Value partitionedIV = outerScfFor ? outerScfFor.getInductionVar()
                                           : outerAffineFor.getInductionVar();
 
@@ -576,7 +599,9 @@ struct ConvertReplicateOp : public OpConversionPattern<mlir::dhir::ReplicateOp>
             for (size_t i = 0; i < insVec.size(); ++i)
                 if (insVec[i] == memref &&
                     arrayPartitionInfoInVec[i].strategy !=
-                        mlir::dhir::ArrayPartitioningInfo::NO_PARTITION)
+                        mlir::dhir::ArrayPartitioningInfo::NO_PARTITION &&
+                    arrayPartitionInfoInVec[i].haloLeft == 0 &&
+                    arrayPartitionInfoInVec[i].haloRight == 0)
                     return true;
             for (size_t i = 0; i < outsVec.size(); ++i)
                 if (outsVec[i] == memref &&
@@ -917,7 +942,8 @@ struct ConvertReplicateOp : public OpConversionPattern<mlir::dhir::ReplicateOp>
                 auto in = insVec[i];
                 auto partitionInfo = arrayPartitionInfoInVec[i];
 
-                if (partitionInfo.strategy != partitionInfo.NO_PARTITION && !isStencil)
+                if (partitionInfo.strategy != partitionInfo.NO_PARTITION &&
+                    partitionInfo.haloLeft == 0 && partitionInfo.haloRight == 0)
                 {
                     Value subview = createPartitionSubview(in, partitionInfo);
                     if (subview)
@@ -952,7 +978,7 @@ struct ConvertReplicateOp : public OpConversionPattern<mlir::dhir::ReplicateOp>
                     partialReduceIdx.push_back(i);
                     outputPartitionDims.push_back(-1);
                 }
-                else if (partitionInfo.strategy != partitionInfo.NO_PARTITION && !isStencil)
+                else if (partitionInfo.strategy != partitionInfo.NO_PARTITION)
                 {
                     Value subview = createPartitionSubview(out, partitionInfo);
                     if (!subview)
@@ -974,7 +1000,8 @@ struct ConvertReplicateOp : public OpConversionPattern<mlir::dhir::ReplicateOp>
                     outputPartitionDims.push_back(0);
                 }
 
-                if (mlir::dhir::doesOutputNeedBroadcast(op, out))
+                if (op->hasAttr("forceBroadcast") ||
+                    mlir::dhir::doesOutputNeedBroadcast(op, out))
                     needBroadcast = true;
             }
 
@@ -1019,6 +1046,16 @@ struct ConvertReplicateOp : public OpConversionPattern<mlir::dhir::ReplicateOp>
                                 rewriter.getDenseI64ArrayAttr(partialReduceIdx));
             taskOp->setAttr("outputPartitionDims",
                             rewriter.getDenseI64ArrayAttr(outputPartitionDims));
+            if (isStencil && stencilPartitionDim >= 0)
+            {
+                taskOp->setAttr("stencil", rewriter.getUnitAttr());
+                taskOp->setAttr("stencilPartitionDim",
+                                rewriter.getI64IntegerAttr(stencilPartitionDim));
+                taskOp->setAttr("haloLeft",
+                                rewriter.getI64IntegerAttr(stencilHaloLeft));
+                taskOp->setAttr("haloRight",
+                                rewriter.getI64IntegerAttr(stencilHaloRight));
+            }
 
             if (taskOp.getRegion().empty())
                 rewriter.createBlock(&taskOp.getRegion());
@@ -1039,10 +1076,12 @@ struct ConvertReplicateOp : public OpConversionPattern<mlir::dhir::ReplicateOp>
                     emitZeroFill(rewriter, priv, 0, zeroIndices);
                 }
             }
-            // The zero-fill loops left the insertion point inside them; put it
-            // back at the head of the task body so the cloned body follows the
-            // initialisation.
-            rewriter.setInsertionPointToStart(&taskOp.getRegion().front());
+            // The zero-fill loops moved the insertion point inside them; put
+            // it back at the END of the task body so the cloned body follows
+            // the initialisation.  setInsertionPointToStart would insert the
+            // body before the init ops, letting the compute run first and the
+            // copy/zero-fill clobber every partial (e.g. spmv, histo).
+            rewriter.setInsertionPointToEnd(&taskOp.getRegion().front());
 
             //   rebased  -> [0,chunk)
             //   otherwise -> [start,end), global
@@ -1253,6 +1292,20 @@ struct ConvertReplicateOp : public OpConversionPattern<mlir::dhir::ReplicateOp>
                                       : rewriter.create<arith::ConstantIndexOp>(
                                             clonedScfFor.getLoc(), loopUb);
 
+                    // A scatter output (partialReduce) is updated through a
+                    // data-dependent index via plain load/modify/store, so
+                    // concurrent iterations would lose updates.  The shard is
+                    // already the unit of MPI parallelism; keep its own loop
+                    // serial rather than emitting a racy scf.parallel.
+                    if (hasPartialReduceOutput)
+                    {
+                        clonedScfFor.getLowerBoundMutable().assign(lbVal);
+                        clonedScfFor.getUpperBoundMutable().assign(ubVal);
+                        rebaseUnslicedAccesses(clonedScfFor,
+                                               clonedScfFor.getInductionVar());
+                        continue;
+                    }
+
                     auto parallelOp = rewriter.create<scf::ParallelOp>(
                         clonedScfFor.getLoc(),
                         ValueRange{lbVal},
@@ -1289,6 +1342,16 @@ struct ConvertReplicateOp : public OpConversionPattern<mlir::dhir::ReplicateOp>
                         clonedAffineFor.getLoc(), loopUb);
                     Value stepVal = rewriter.create<arith::ConstantIndexOp>(
                         clonedAffineFor.getLoc(), clonedAffineFor.getStepAsInt());
+
+                    // Same scatter race as the scf.for path above: keep the
+                    // shard's loop serial when an output is updated through a
+                    // data-dependent index.
+                    if (hasPartialReduceOutput)
+                    {
+                        rebaseUnslicedAccesses(clonedAffineFor,
+                                               clonedAffineFor.getInductionVar());
+                        continue;
+                    }
 
                     auto parallelOp = rewriter.create<scf::ParallelOp>(
                         clonedAffineFor.getLoc(),

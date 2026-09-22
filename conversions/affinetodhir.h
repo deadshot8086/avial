@@ -13,6 +13,7 @@
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 
 #include "includes/dhirDialect.h"
 #include "includes/dhirOps.h"
@@ -28,6 +29,7 @@
 #include "analysis/arrayPartitionAnalysis.h"
 
 #include <string>
+#include <functional>
 
 using namespace mlir;
 using namespace dhir;
@@ -44,6 +46,153 @@ namespace mlir
         struct ConvertAffineToDhirPass : public mlir::dhir::impl::ConvertAffineToDhirPassBase<ConvertAffineToDhirPass>
         {
             using ConvertAffineToDhirPassBase::ConvertAffineToDhirPassBase;
+
+            bool isUnitStep(mlir::scf::ForOp loop)
+            {
+                auto step = loop.getStep().getDefiningOp<mlir::arith::ConstantIndexOp>();
+                return step && step.value() == 1;
+            }
+
+            bool sameIndices(ValueRange lhs, ValueRange rhs)
+            {
+                return lhs.size() == rhs.size() &&
+                       std::equal(lhs.begin(), lhs.end(), rhs.begin());
+            }
+
+            bool isAdditiveReadModifyWrite(mlir::memref::StoreOp store)
+            {
+                Operation *def = store.getValue().getDefiningOp();
+                if (!def || !isa<mlir::arith::AddFOp, mlir::arith::AddIOp>(def))
+                    return false;
+
+                for (Value operand : def->getOperands())
+                {
+                    auto load = operand.getDefiningOp<mlir::memref::LoadOp>();
+                    if (load && load.getMemRef() == store.getMemRef() &&
+                        sameIndices(load.getIndices(), store.getIndices()))
+                        return true;
+                }
+                return false;
+            }
+
+            // A loop whose IV is unused repeats one computation every
+            // iteration (e.g. an `iters` convergence loop).  Its iterations
+            // address no disjoint data, so partitioning it would make every
+            // shard recompute the whole output and the combine would sum the
+            // duplicates.  Never select it; let an inner loop carry the
+            // parallelism.
+            bool isIVInvariantBody(mlir::scf::ForOp loop)
+            {
+                return loop.getInductionVar().use_empty();
+            }
+
+            // SCF lacks the affine dependence test below.  Accept only the
+            // common kernel shape: overwrites advance with the IV; other
+            // writes must be additive read-modify-write reductions.
+            bool isScfLoopIndependent(mlir::scf::ForOp loop)
+            {
+                if (!loop.getInitArgs().empty() || !isUnitStep(loop))
+                    return false;
+
+                if (isIVInvariantBody(loop))
+                {
+                    llvm::errs() << "SCF loop body is invariant in its IV "
+                                    "(repeat loop); not partitioning it\n";
+                    return false;
+                }
+
+                Value iv = loop.getInductionVar();
+                mlir::dhir::ArrayPartitioningAnalysis analysis(loop, iv);
+                llvm::SmallVector<mlir::memref::LoadOp> loads;
+                llvm::SmallVector<mlir::memref::StoreOp> stores;
+                loop.walk([&](mlir::memref::LoadOp load) { loads.push_back(load); });
+                loop.walk([&](mlir::memref::StoreOp store) { stores.push_back(store); });
+
+                if (stores.empty())
+                    return false;
+
+                for (mlir::memref::StoreOp store : stores)
+                {
+                    auto storeAccess = analysis.getUnitStrideDimensionAndOffset(store, iv);
+                    if (!storeAccess)
+                    {
+                        if (!isAdditiveReadModifyWrite(store))
+                            return false;
+                        continue;
+                    }
+                    if (storeAccess->second != 0)
+                        return false;
+
+                    // An in-place load from another iteration's slice is a real
+                    // loop-carried dependence, not a stencil input halo.
+                    for (mlir::memref::LoadOp load : loads)
+                    {
+                        if (load.getMemRef() != store.getMemRef())
+                            continue;
+                        auto loadAccess =
+                            analysis.getUnitStrideDimensionAndOffset(load, iv);
+                        if (!loadAccess || loadAccess->first != storeAccess->first ||
+                            loadAccess->second != storeAccess->second)
+                            return false;
+                    }
+                }
+
+                llvm::errs() << "SCF loop is conservatively independent\n";
+                return true;
+            }
+
+            bool isStencilLoop(Operation *loop, Value iv,
+                               const llvm::SmallVector<llvm::SmallVector<Value>> &insouts)
+            {
+                mlir::dhir::ArrayPartitioningAnalysis analysis(loop, iv);
+                for (Value in : insouts[0])
+                {
+                    auto info = analysis.analyzeArray(in);
+                    if (info.haloLeft > 0 || info.haloRight > 0)
+                        return true;
+                }
+                for (Value out : insouts[1])
+                {
+                    auto info = analysis.analyzeArray(out);
+                    if (info.haloLeft > 0 || info.haloRight > 0)
+                        return true;
+                }
+                return false;
+            }
+
+            void wrapScfLoop(mlir::scf::ForOp loop, mlir::OpBuilder &builder,
+                             int &repId)
+            {
+                auto insouts = InsOutsAnalysis::getInsandOut(loop);
+                bool isStencil =
+                    isStencilLoop(loop, loop.getInductionVar(), insouts);
+
+                // A shard nested in serial control flow may feed the next
+                // iteration; force a broadcast so its writes stay ordered.
+                bool forceBroadcast =
+                    loop->getParentOfType<mlir::scf::ForOp>() ||
+                    loop->getParentOfType<mlir::scf::WhileOp>();
+
+                builder.setInsertionPoint(loop);
+                auto replicateOp = builder.create<mlir::dhir::ReplicateOp>(
+                    loop.getLoc(), insouts[0], insouts[1]);
+                replicateOp->setAttr("replicateID",
+                                     builder.getI64IntegerAttr(repId));
+                replicateOp->setAttr(
+                    "pattern",
+                    builder.getStringAttr(isStencil ? "stencil" : "default"));
+                if (forceBroadcast)
+                    replicateOp->setAttr("forceBroadcast", builder.getUnitAttr());
+
+                mlir::Block *newBlock =
+                    builder.createBlock(&replicateOp.getBodyRegion());
+                loop->moveBefore(newBlock, newBlock->end());
+                builder.setInsertionPointToEnd(newBlock);
+                builder.create<mlir::dhir::YieldOp>(builder.getUnknownLoc());
+                llvm::errs() << "Wrapped SCF loop with ReplicateOp (replicateID="
+                             << repId << ")\n";
+                ++repId;
+            }
 
             // Helper function to check if a loop is independent (considering only its own iterations)
             // This checks the loop in isolation, not in the context of parent loops
@@ -238,6 +387,23 @@ namespace mlir
                                 // Check dependence at depth 1 (outer loop)
                                 int outerDep = checkLoopDependence(forOp, 1);
                                 
+                                // An unused-IV loop repeats one computation (an
+                                // `iters` loop); the dependence test reports no
+                                // conflict, but partitioning it is unsound — every
+                                // shard would recompute the whole output and the
+                                // combine would sum the duplicates (spmv/histo
+                                // came out scaled by the shard count).
+                                //
+                                // Distributing an inner loop instead still breaks:
+                                // the partialReduce combine mishandles scatter
+                                // outputs (spmv's disjoint overwrite gets summed
+                                // onto shard 0's old data; histo's i8 saturating
+                                // scatter-add under-counts).  Until the combine is
+                                // reworked per scatter kind, keep the whole nest
+                                // unpartitioned so every rank redundantly computes
+                                // the correct result.
+                                bool ivRepeatLoop = forOp.getInductionVar().use_empty();
+
                                 if (outerDep == 1) // Outer loop has dependence
                                 {
                                     // Collect all inner loops
@@ -286,6 +452,11 @@ namespace mlir
                                     {
                                         llvm::errs() << "Loop carries iter_args; leaving it unpartitioned\n";
                                     }
+                                    else if (ivRepeatLoop)
+                                    {
+                                        llvm::errs() << "Loop body is invariant in its IV "
+                                                        "(repeat loop); leaving it unpartitioned\n";
+                                    }
                                     else
                                         toReplicateVector.push_back(forOp);
                                 }
@@ -315,9 +486,26 @@ namespace mlir
                     affine::AffineForOp forOp = mlir::dyn_cast<affine::AffineForOp>(op);
                     auto insouts = InsOutsAnalysis::getInsandOut(forOp);
 
+                    bool isStencil = false;
+                    mlir::dhir::ArrayPartitioningAnalysis analysis(
+                        forOp.getOperation(), forOp.getInductionVar());
+                    for (Value in : insouts[0])
+                    {
+                        auto info = analysis.analyzeArray(in);
+                        isStencil |= info.haloLeft > 0 || info.haloRight > 0;
+                    }
+                    for (Value out : insouts[1])
+                    {
+                        auto info = analysis.analyzeArray(out);
+                        isStencil |= info.haloLeft > 0 || info.haloRight > 0;
+                    }
+
                     builder.setInsertionPoint(forOp);
                     auto replicateOp = builder.create<mlir::dhir::ReplicateOp>(forOp.getLoc(), insouts[0], insouts[1]);
                     replicateOp->setAttr("replicateID", builder.getI64IntegerAttr(repId));
+                    replicateOp->setAttr(
+                        "pattern",
+                        builder.getStringAttr(isStencil ? "stencil" : "default"));
 
                     mlir::Region &replicateRegion = replicateOp.getBodyRegion();
                     mlir::Block *newBlock = builder.createBlock(&replicateRegion);
@@ -327,6 +515,41 @@ namespace mlir
                     builder.create<mlir::dhir::YieldOp>(builder.getUnknownLoc());
                     ++repId;
                 }
+
+                // Select the outermost conservatively independent loops,
+                // including loops nested in serial SCF control flow, without
+                // nesting a replicate under an already-selected loop.  Tasks
+                // under a loop-carried scf.for stay serial: DHIR has no
+                // contract for cloning the carried iteration state across
+                // shards.
+                llvm::SmallVector<mlir::scf::ForOp> scfCandidates;
+                module->walk<mlir::WalkOrder::PreOrder>([&](mlir::scf::ForOp loop) {
+                    for (Operation *parent = loop->getParentOp(); parent;
+                         parent = parent->getParentOp())
+                    {
+                        if (auto carried = dyn_cast<mlir::scf::ForOp>(parent);
+                            carried && !carried.getInitArgs().empty())
+                        {
+                            llvm::errs()
+                                << "Leaving SCF loop under loop-carried ancestor "
+                                << "unpartitioned\n";
+                            return;
+                        }
+                        if (llvm::is_contained(toReplicateVector, parent) ||
+                            llvm::is_contained(toConvergeVector, parent))
+                            return;
+                    }
+
+                    for (mlir::scf::ForOp selected : scfCandidates)
+                        if (selected->isProperAncestor(loop))
+                            return;
+
+                    if (isScfLoopIndependent(loop))
+                        scfCandidates.push_back(loop);
+                });
+
+                for (mlir::scf::ForOp loop : scfCandidates)
+                    wrapScfLoop(loop, builder, repId);
 
                 // Create ConvergeOp for loops with dependencies
                 int taskId = 1;

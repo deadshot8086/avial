@@ -330,199 +330,71 @@ void generateBroadcastCommunication(
     }
 
     llvm::errs() << "\n=== Generating Broadcast Communication ===\n";
-    llvm::errs() << "Number of buffers to broadcast: " << toBroadcast.size() << "\n";
 
-    // Helper: the runtime extent of `buffer` on dim `d`, as an index Value.
-    // A dynamic dim reads the descriptor (memref.dim); the sentinel must never
-    // be used as a compile-time extent.  A static dim is a constant.
-    std::function<Value(Value, unsigned)> bufferExtent = [&](Value buffer, unsigned d) -> Value {
-        auto ty = cast<MemRefType>(buffer.getType());
-        if (!ty.isDynamicDim(d))
-            return rewriter.create<arith::ConstantIndexOp>(
-                loc, ty.getDimSize(d));
-        return rewriter.create<memref::DimOp>(loc, buffer, (int64_t)d);
+    // The gather leaves the complete result in the root's base memref, so the
+    // broadcast must operate on the base memref itself; reconstructing a
+    // larger subview from shard views is wrong for column partitions (and
+    // rank > 2).
+    SmallVector<Value> buffers;
+    auto unwrapBase = [](Value value) {
+        while (Operation *def = value.getDefiningOp()) {
+            auto view = dyn_cast<memref::SubViewOp>(def);
+            if (!view)
+                break;
+            value = view.getSource();
+        }
+        return value;
     };
-
-    // Total rows spanned by the (contiguous) row ranges in toBroadcast, and the
-    // common trailing extent, both as runtime index values so dynamic dims are
-    // sized from the descriptor.  All subBuffers subview the same source, so
-    // they agree on trailing extents; dim-1 is taken from the first buffer.
-    Value totalFirstDimVal = rewriter.create<arith::ConstantIndexOp>(loc, 0);
-    int64_t staticSecondDim = -1;
-    bool dynamicSecondDim = false;
-
-    for (Value subBuffer : toBroadcast)
-    {
-        auto memrefType = mlir::dyn_cast<mlir::MemRefType>(subBuffer.getType());
-
-        llvm::errs() << "Memref Type: " << memrefType << "\n";
-
-        if (!memrefType)
-        {
-            llvm::errs() << "Warning: Non-memref type in toBroadcast\n";
+    for (Value value : toBroadcast) {
+        if (!isa<MemRefType>(value.getType()))
             continue;
-        }
-
-        auto shape = memrefType.getShape();
-        if (shape.size() >= 2)
-        {
-            totalFirstDimVal = rewriter.create<arith::AddIOp>(
-                loc, totalFirstDimVal, bufferExtent(subBuffer, 0));
-            if (memrefType.isDynamicDim(1))
-            {
-                dynamicSecondDim = true;
-            }
-            else if (!dynamicSecondDim)
-            {
-                if (staticSecondDim == -1)
-                    staticSecondDim = shape[1];
-                else if (staticSecondDim != shape[1])
-                    llvm::errs() << "Warning: Inconsistent second dimension in buffers\n";
-            }
-        }
-        else if (shape.size() < 2)
-        {
-            totalFirstDimVal = rewriter.create<arith::AddIOp>(
-                loc, totalFirstDimVal, bufferExtent(subBuffer, 0));
-        }
+        Value base = unwrapBase(value);
+        if (!llvm::is_contained(buffers, base))
+            buffers.push_back(base);
     }
 
-    // Get the source buffer (unwrap from first subview)
-    Value sourceBuffer = toBroadcast[0];
-    while (auto subviewOp = sourceBuffer.getDefiningOp<memref::SubViewOp>())
-    {
-        sourceBuffer = subviewOp.getSource();
+    if (buffers.empty()) {
+        llvm::errs() << "No memref buffers to broadcast\n";
+        return;
     }
 
-    // Create a combined subview that covers all the buffers to broadcast
-    // This assumes all buffers are contiguous in the source buffer
-    SmallVector<OpFoldResult> offsets;
-    SmallVector<OpFoldResult> sizes;
-    SmallVector<OpFoldResult> strides;
-
-    // Get offset from the first buffer
-
-    if (auto bcastType = mlir::dyn_cast<MemRefType>(toBroadcast[0].getType());
-        bcastType && bcastType.getRank() >= 2)
-    {
-        if (auto firstSubview = toBroadcast[0].getDefiningOp<memref::SubViewOp>())
-        {
-            offsets = llvm::to_vector(firstSubview.getMixedOffsets());
-        }
-        else
-        {
-            // Default offsets if not a subview
-            offsets = {rewriter.getIndexAttr(0), rewriter.getIndexAttr(0)};
-        }
-
-        // Trailing extent: the first buffer's dim-1, dynamic or static.
-        OpFoldResult secondDimVal = dynamicSecondDim
-            ? OpFoldResult(bufferExtent(toBroadcast[0], 1))
-            : OpFoldResult(rewriter.getIndexAttr(staticSecondDim));
-
-        // Set sizes: total first dimension and the common second dimension
-        sizes = {
-            OpFoldResult(totalFirstDimVal),
-            secondDimVal};
-
-        // Default strides
-        strides = {
-            rewriter.getIndexAttr(1),
-            rewriter.getIndexAttr(1)};
-    }
-
-    else
-    {
-        offsets.push_back(rewriter.getIndexAttr(0));
-        sizes.push_back(OpFoldResult(totalFirstDimVal));
-        strides.push_back(rewriter.getIndexAttr(1));
-    }
-
-    // Create the combined subview for broadcasting
-    Value broadcastBuffer = rewriter.create<memref::SubViewOp>(
-        loc,
-        sourceBuffer,
-        offsets,
-        sizes,
-        strides);
-
-    llvm::errs() << "Created combined broadcast buffer\n";
-
-    // Generate broadcast communication using Send/Recv
-    // The rank corresponding to node0 acts as the broadcast root
-    // The broadcast root sends to all non-root ranks
-    // All other ranks receive from the broadcast root
-    auto cond = rewriter.create<arith::CmpIOp>(
-        loc,
-        rewriter.getI1Type(),
-        arith::CmpIPredicate::eq,
-        rank,
-        rootRank);
-
-    auto ifOp = rewriter.create<mlir::scf::IfOp>(
-        loc,
-        mlir::TypeRange{},
-        cond,
-        true);
-
-    // Then block: Broadcast root - Send to all non-root ranks
-    OpBuilder thenBuilder = ifOp.getThenBodyBuilder(rewriter.getListener());
-
-    // Get total number of nodes/ranks
-    // Create a loop over all ranks
-    // for (i=0; i < numRanks; i++)
-    auto zeroIndex = thenBuilder.create<arith::ConstantIndexOp>(loc, 0);
-    auto step = thenBuilder.create<arith::ConstantIndexOp>(loc, 1);
-
-    // Convert numRanks to index type if it's not already
     Value numRanksIndex = numRanks;
-    if (mlir::isa<mlir::IntegerType>(numRanks.getType()))
-    {
-        numRanksIndex = thenBuilder.create<arith::IndexCastOp>(
-            loc,
-            rewriter.getIndexType(),
-            numRanks);
+    if (isa<IntegerType>(numRanks.getType()))
+        numRanksIndex = rewriter.create<arith::IndexCastOp>(
+            loc, rewriter.getIndexType(), numRanks);
+
+    auto rootCond = rewriter.create<arith::CmpIOp>(
+        loc, rewriter.getI1Type(), arith::CmpIPredicate::eq, rank, rootRank);
+
+    // One deterministic send/receive phase per base buffer; reusing the tag
+    // is safe because all ranks run the phases in the same order and MPI
+    // preserves source/destination ordering.
+    for (Value buffer : buffers) {
+        auto ifOp = rewriter.create<scf::IfOp>(loc, TypeRange{}, rootCond, true);
+        OpBuilder thenBuilder = ifOp.getThenBodyBuilder(rewriter.getListener());
+
+        Value zero = thenBuilder.create<arith::ConstantIndexOp>(loc, 0);
+        Value step = thenBuilder.create<arith::ConstantIndexOp>(loc, 1);
+        auto forOp = thenBuilder.create<scf::ForOp>(loc, zero, numRanksIndex, step);
+        OpBuilder forBuilder(forOp.getBody(), forOp.getBody()->begin());
+        Value targetRank = forOp.getInductionVar();
+        Value targetRankI32 = forBuilder.create<arith::IndexCastOp>(
+            loc, rewriter.getI32Type(), targetRank);
+        Value sendCond = forBuilder.create<arith::CmpIOp>(
+            loc, rewriter.getI1Type(), arith::CmpIPredicate::ne,
+            targetRankI32, rootRank);
+        auto sendIf = forBuilder.create<scf::IfOp>(
+            loc, TypeRange{}, sendCond, true);
+        OpBuilder sendBuilder = sendIf.getThenBodyBuilder(forBuilder.getListener());
+        sendBuilder.create<mpi::SendOp>(loc, retVal, buffer, tag,
+                                        targetRankI32, comm);
+        (void)sendIf.getElseBodyBuilder(forBuilder.getListener());
+
+        OpBuilder elseBuilder = ifOp.getElseBodyBuilder(rewriter.getListener());
+        elseBuilder.create<mpi::RecvOp>(loc, retVal, buffer, tag,
+                                        rootRank, comm);
     }
 
-    auto forOp = thenBuilder.create<scf::ForOp>(loc, zeroIndex, numRanksIndex, step);
-    OpBuilder forBuilder(forOp.getBody(), forOp.getBody()->begin());
-
-    // Get loop induction variable (target rank)
-    Value targetRank = forOp.getInductionVar();
-
-    // Convert index to i32 for MPI
-    auto targetRankI32 = forBuilder.create<arith::IndexCastOp>(
-        loc,
-        rewriter.getI32Type(),
-        targetRank);
-
-    // Skip sending to the broadcast root itself
-    auto sendCond = forBuilder.create<arith::CmpIOp>(loc, rewriter.getI1Type(), arith::CmpIPredicate::ne, targetRankI32, rootRank);
-    auto sendIf = forBuilder.create<scf::IfOp>(loc, mlir::TypeRange{}, sendCond, false);
-    OpBuilder sendBuilder = sendIf.getThenBodyBuilder(forBuilder.getListener());
-    auto sendOp = sendBuilder.create<mlir::mpi::SendOp>(
-        loc,
-        retVal,          // return type
-        broadcastBuffer, // buffer to send
-        tag,             // tag
-        targetRankI32,   // destination rank
-        comm             // communicator
-    );
-
-    llvm::errs() << "Generated broadcast sends from broadcast root to all other ranks\n";
-
-    // Else block: Other ranks - Receive from broadcast root
-    OpBuilder elseBuilder = ifOp.getElseBodyBuilder(rewriter.getListener());
-
-    auto recvOp = elseBuilder.create<mlir::mpi::RecvOp>(
-        loc,
-        retVal,          // return type
-        broadcastBuffer, // buffer to receive into
-        tag,             // tag
-        rootRank,        // source rank (broadcast root)
-        comm             // communicator
-    );
-
-    llvm::errs() << "Generated broadcast receive for other ranks from broadcast root\n";
-    llvm::errs() << "=== Broadcast Communication Complete ===\n\n";
+    llvm::errs() << "Broadcasted " << buffers.size()
+                 << " assembled base buffer(s)\n";
 }
