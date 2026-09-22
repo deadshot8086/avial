@@ -141,6 +141,59 @@ namespace mlir
                 return true;
             }
 
+            // A rank-1 (flat) output stored as `IV*coeff + base`, coeff != 1,
+            // is a scaled slab: shard [s,e) writes [s*coeff+base, e*coeff+base),
+            // but the gather slices the raw [s,e) — wrong bytes.  Not fixable
+            // with SUM partialReduce (disjoint overwrites, not adds), so leave
+            // such loops unpartitioned (serially correct, like spmv/histo).
+            bool hasScaledFlatSlabStore(mlir::affine::AffineForOp loop)
+            {
+                Value iv = loop.getInductionVar();
+                bool scaled = false;
+                loop.walk([&](mlir::affine::AffineStoreOp store) {
+                    auto memrefTy = dyn_cast<MemRefType>(store.getMemRef().getType());
+                    if (!memrefTy || memrefTy.getRank() != 1)
+                        return;
+                    auto operands = store.getMapOperands();
+                    int ivPos = -1;
+                    for (int k = 0; k < (int)operands.size(); ++k)
+                        if (operands[k] == iv) { ivPos = k; break; }
+                    if (ivPos < 0)
+                        return;
+                    AffineMap map = store.getAffineMap();
+                    if (map.getNumResults() != 1)
+                        return;
+                    AffineExpr expr = map.getResult(0);
+                    unsigned numDims = map.getNumDims();
+                    AffineExpr ivExpr =
+                        (ivPos < (int)numDims)
+                            ? getAffineDimExpr(ivPos, loop.getContext())
+                            : getAffineSymbolExpr(ivPos - numDims, loop.getContext());
+                    std::function<int64_t(AffineExpr, int64_t)> coeff =
+                        [&](AffineExpr node, int64_t mult) -> int64_t {
+                        if (node == ivExpr)
+                            return mult;
+                        if (auto bin = dyn_cast<AffineBinaryOpExpr>(node)) {
+                            if (bin.getKind() == AffineExprKind::Add)
+                                return coeff(bin.getLHS(), mult) +
+                                       coeff(bin.getRHS(), mult);
+                            if (bin.getKind() == AffineExprKind::Mul) {
+                                if (auto rc = dyn_cast<AffineConstantExpr>(bin.getRHS());
+                                    rc && bin.getLHS() == ivExpr)
+                                    return mult * rc.getValue();
+                                if (auto lc = dyn_cast<AffineConstantExpr>(bin.getLHS());
+                                    lc && bin.getRHS() == ivExpr)
+                                    return mult * lc.getValue();
+                            }
+                        }
+                        return 0;
+                    };
+                    if (coeff(expr, 1) != 1)
+                        scaled = true;
+                });
+                return scaled;
+            }
+            
             bool isStencilLoop(Operation *loop, Value iv,
                                const llvm::SmallVector<llvm::SmallVector<Value>> &insouts)
             {
