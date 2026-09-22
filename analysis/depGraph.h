@@ -24,6 +24,7 @@ struct TaskOpInfo
   llvm::SmallVector<mlir::Value> writes;
   llvm::SmallVector<mlir::Value> actualBuffer;
 
+  llvm::SmallVector<mlir::Value> reduceTargets;
   llvm::SmallVector<TaskOpInfo *> deps;
   TargetType target;
   
@@ -309,8 +310,25 @@ namespace mlir
           for (auto out : task.getOutputs())
             info.writes.push_back(out);
 
-          for (auto actual : task.getOutputs())
+          for (auto actual : task.getActualBuffer())
             info.actualBuffer.push_back(actual);
+
+          // The partialReduce combine seeds from and accumulates into the
+          // task's *actual* output buffer, which never appears in
+          // getOutputs()/getInputs() — so a producer that wrote it earlier
+          // shows no conflict and lands in the same level, racing its
+          // not-yet-gathered writes.  Track these buffers (reduceTargets) as
+          // read+write for the dependency check; keep reads/writes/actualBuffer
+          // untouched since downstream code requires them aligned with the
+          // getInputs()/getOutputs()/getActualBuffer() lists.
+          if (auto reduceAttr =
+                  task->getAttrOfType<mlir::DenseI64ArrayAttr>("partialReduce"))
+          {
+            auto actuals = task.getActualBuffer();
+            for (int64_t idx : reduceAttr.asArrayRef())
+              if (idx >= 0 && idx < (int64_t)actuals.size())
+                info.reduceTargets.push_back(actuals[idx]);
+          }
 
           tasks.push_back(std::move(info));
         });
@@ -412,6 +430,37 @@ namespace mlir
               llvm::errs() << "    WAR dependency detected\n";
               return true;
             }
+          }
+        }
+        
+        // A partialReduce combine both reads and writes its actual output
+        // buffer, so treat each reduce target as conflicting with the other
+        // task's reads, writes, and reduce targets (covers RAW/WAR/WAW against
+        // an ordinary producer like tpacf's zeroing, and RMW-vs-RMW between two
+        // reductions into the same buffer).
+        auto conflictsAny = [&](mlir::Value v,
+                                llvm::ArrayRef<mlir::Value> group) {
+          for (auto other : group)
+            if (memoryAccessesConflict(v, other))
+              return true;
+          return false;
+        };
+        for (auto ri : taskI.reduceTargets)
+        {
+          if (conflictsAny(ri, taskJ.writes) ||
+              conflictsAny(ri, taskJ.reads) ||
+              conflictsAny(ri, taskJ.reduceTargets))
+          {
+            llvm::errs() << "    reduction-target dependency detected\n";
+            return true;
+          }
+        }
+        for (auto rj : taskJ.reduceTargets)
+        {
+          if (conflictsAny(rj, taskI.writes) || conflictsAny(rj, taskI.reads))
+          {
+            llvm::errs() << "    reduction-target dependency detected\n";
+            return true;
           }
         }
         
