@@ -377,42 +377,18 @@ struct ConvertReplicateOp : public OpConversionPattern<mlir::dhir::ReplicateOp>
         Value partitionedIV = outerScfFor ? outerScfFor.getInductionVar()
                                           : outerAffineFor.getInductionVar();
 
-        auto supportsContiguousRowTransfer = [](MemRefType type) {
-            // A row transfer still needs concrete trailing extents.  Check
-            // those before the zero-extent fast path; otherwise memref<0x?xf32>
-            // would reach the MPI gather with the dynamic sentinel as a static
-            // subview size.
-            for (int64_t dim = 1; dim < type.getRank(); ++dim)
-                if (type.isDynamicDim(dim))
-                    return false;
-
-            for (int64_t dim = 0; dim < type.getRank(); ++dim)
-                if (type.getDimSize(dim) == 0)
-                    return true;
-
-            if (type.getLayout().isIdentity())
-                return true;
-
-            int64_t offset = 0;
-            SmallVector<int64_t> strides;
-            if (failed(type.getStridesAndOffset(strides, offset)))
+        // MPIToLLVM can transfer both contiguous slabs and strided views through
+        // a derived datatype. Keep the structural checks here: the partitioner
+        // supports ranked memrefs up to rank three and cannot form a useful
+        // subview through a statically empty dimension.
+        auto supportsPartitionTransfer = [](MemRefType type) {
+            if (type.getRank() < 1 || type.getRank() > 3)
                 return false;
-
-            int64_t expectedStride = 1;
-            for (int64_t dim = type.getRank() - 1; dim >= 0; --dim) {
-                int64_t extent = type.getDimSize(dim);
-                if (extent != 1 &&
-                    (strides[dim] == ShapedType::kDynamic ||
-                     strides[dim] != expectedStride))
+            for (int64_t dim = 0; dim < type.getRank(); ++dim)
+                if (type.isDynamicDim(dim))
+                    continue;
+                else if (type.getDimSize(dim) == 0)
                     return false;
-
-                if (dim == 0)
-                    break;
-                if (extent <= 0 ||
-                    expectedStride > std::numeric_limits<int64_t>::max() / extent)
-                    return false;
-                expectedStride *= extent;
-            }
             return true;
         };
 
@@ -501,10 +477,21 @@ struct ConvertReplicateOp : public OpConversionPattern<mlir::dhir::ReplicateOp>
                 return indexAdvancesWithIV(tr.getIn(), coefficient);
             return false;
         };
-        for (Value out : outsVec) {
+        // Some outputs cannot be gathered as a slab at all: their store index is
+        // data dependent (histogram bins, permuted rows, cluster ids).  Those are
+        // still parallelisable, but they are reductions rather than slabs: each
+        // shard accumulates into a private buffer and the buffers are summed.
+        // Seeding shard 0's buffer with the output as it stands and zeroing the
+        // others makes that sum exactly the sequential result, both for
+        // read-modify-write accumulation and for disjoint overwrite.
+        llvm::SmallVector<bool> partialReduceOut(outsVec.size(), false);
+        bool hasPartialReduceOutput = false;
+
+        for (size_t outIdx = 0; outIdx < outsVec.size(); ++outIdx) {
+            Value out = outsVec[outIdx];
             auto type = dyn_cast<MemRefType>(out.getType());
-            if (!type || !supportsContiguousRowTransfer(type)) {
-                op.emitError("output cannot be gathered as a contiguous dimension-0 row slab");
+            if (!type || !supportsPartitionTransfer(type)) {
+                op.emitError("output cannot be represented as a supported partition view");
                 return failure();
             }
 
@@ -556,10 +543,15 @@ struct ConvertReplicateOp : public OpConversionPattern<mlir::dhir::ReplicateOp>
                     unsupportedStore = true;
             });
 
-if (!sawStore || unsupportedStore) {
-                op.emitError("output stores must advance with the partitioned IV "
-                             "on dimension 0 for row-slab gathering");
+            if (!sawStore) {
+                op.emitError("replicate output is never stored to");
                 return failure();
+            }
+            // A store that does not advance with the partitioned IV makes the
+            // whole output a reduction target.
+            if (unsupportedStore) {
+                partialReduceOut[outIdx] = true;
+                hasPartialReduceOutput = true;
             }
         }
 
@@ -569,6 +561,11 @@ if (!sawStore || unsupportedStore) {
         // the narrowest case and unnecessarily removed legal slices.
         llvm::SmallVector<Value> unslicedIVMemrefs;
         bool forceAbsoluteBounds = false;
+        // A partial-reduce output is written with global indices into a private
+        // buffer, so its shard must iterate the absolute range: slicing any
+        // other operand would put the body in shard-local coordinates.
+        if (hasPartialReduceOutput)
+            forceAbsoluteBounds = true;
         mlir::dhir::ArrayPartitioningAnalysis *partitionAnalysis = nullptr;
         std::optional<mlir::dhir::ArrayPartitioningAnalysis> analysisStorage;
 
@@ -577,10 +574,14 @@ if (!sawStore || unsupportedStore) {
         };
         auto isSlicedOperand = [&](Value memref) {
             for (size_t i = 0; i < insVec.size(); ++i)
-                if (insVec[i] == memref && arrayPartitionInfoInVec[i].strategy == mlir::dhir::ArrayPartitioningInfo::ROW_PARTITION)
+                if (insVec[i] == memref &&
+                    arrayPartitionInfoInVec[i].strategy !=
+                        mlir::dhir::ArrayPartitioningInfo::NO_PARTITION)
                     return true;
             for (size_t i = 0; i < outsVec.size(); ++i)
-                if (outsVec[i] == memref && arrayPartitionInfoOutVec[i].strategy == mlir::dhir::ArrayPartitioningInfo::ROW_PARTITION)
+                if (outsVec[i] == memref &&
+                    arrayPartitionInfoOutVec[i].strategy !=
+                        mlir::dhir::ArrayPartitioningInfo::NO_PARTITION)
                     return true;
             return false;
         };
@@ -779,6 +780,60 @@ if (!sawStore || unsupportedStore) {
             return rewriter.create<arith::AddIOp>(op.getLoc(), dynLowerVal, shifted);
         };
 
+        // Private accumulation buffers for outputs that are not row slabs: one
+        // buffer per such output, shared by every shard task.  Each rank runs at
+        // most one shard of a replicate, so one buffer per replicate is enough
+        // and costs one output-sized allocation instead of num_devices of them.
+        llvm::SmallVector<Value> privateOutBuffers(outsVec.size());
+        if (hasPartialReduceOutput)
+        {
+            OpBuilder::InsertionGuard privGuard(rewriter);
+            rewriter.setInsertionPoint(op);
+            for (size_t i = 0; i < outsVec.size(); ++i)
+            {
+                if (!partialReduceOut[i])
+                    continue;
+                auto ty = cast<MemRefType>(outsVec[i].getType());
+                SmallVector<Value> dynSizes;
+                for (unsigned d = 0; d < (unsigned)ty.getRank(); ++d)
+                    if (ty.isDynamicDim(d))
+                        dynSizes.push_back(
+                            rewriter.create<memref::DimOp>(op.getLoc(), outsVec[i], (int64_t)d));
+                privateOutBuffers[i] =
+                    rewriter.create<memref::AllocOp>(op.getLoc(), ty, dynSizes);
+            }
+        }
+
+        // Zero every element of a private buffer.  Emitted as nested loops so it
+        // works for any rank and any dynamic extent, and stays inside the
+        // memref/scf/arith dialects the rest of this pipeline already lowers.
+        std::function<void(OpBuilder &, Value, unsigned, llvm::SmallVectorImpl<Value> &)>
+            emitZeroFill = [&](OpBuilder &builder, Value memref, unsigned dim,
+                               llvm::SmallVectorImpl<Value> &indices) {
+                auto type = cast<MemRefType>(memref.getType());
+                if (dim == (unsigned)type.getRank())
+                {
+                    Value zero = builder.create<arith::ConstantOp>(
+                        op.getLoc(), builder.getZeroAttr(type.getElementType()));
+                    builder.create<memref::StoreOp>(op.getLoc(), zero, memref, indices);
+                    return;
+                }
+                Value lower = builder.create<arith::ConstantIndexOp>(op.getLoc(), 0);
+                Value upper;
+                if (type.isDynamicDim(dim))
+                    upper = builder.create<memref::DimOp>(op.getLoc(), memref, (int64_t)dim);
+                else
+                    upper = builder.create<arith::ConstantIndexOp>(
+                        op.getLoc(), type.getDimSize(dim));
+                Value step = builder.create<arith::ConstantIndexOp>(op.getLoc(), 1);
+                auto forOp = builder.create<scf::ForOp>(op.getLoc(), lower, upper, step);
+                builder.setInsertionPointToStart(forOp.getBody());
+                indices.push_back(forOp.getInductionVar());
+                emitZeroFill(builder, memref, dim + 1, indices);
+                indices.pop_back();
+                builder.setInsertionPointAfter(forOp);
+            };
+
         int64_t current = constlowerBound;
         for (int i = 0; i < num_devices; ++i)
         {
@@ -822,38 +877,51 @@ if (!sawStore || unsupportedStore) {
             // run over the absolute range [start, end).
             bool indicesRebased = false;
 
+            auto createPartitionSubview = [&](Value buffer,
+                                              const auto &partitionInfo) -> Value {
+                auto memrefType = dyn_cast<MemRefType>(buffer.getType());
+                if (!memrefType || partitionInfo.partitionDimension < 0 ||
+                    partitionInfo.partitionDimension >= memrefType.getRank())
+                    return Value();
+
+                SmallVector<OpFoldResult> offsets, sizes, strides;
+                for (int64_t d = 0; d < memrefType.getRank(); ++d)
+                {
+                    bool partitioned = d == partitionInfo.partitionDimension;
+                    offsets.push_back(partitioned
+                        ? (dynamicBounds
+                               ? OpFoldResult(startVal)
+                               : OpFoldResult(rewriter.getIndexAttr(
+                                     std::max<int64_t>(0, start))))
+                        : OpFoldResult(rewriter.getIndexAttr(0)));
+
+                    if (partitioned)
+                        sizes.push_back(dynamicBounds
+                            ? OpFoldResult(chunkVal)
+                            : OpFoldResult(rewriter.getIndexAttr(chunk)));
+                    else if (memrefType.isDynamicDim(d))
+                        sizes.push_back(OpFoldResult(rewriter.create<memref::DimOp>(
+                            op.getLoc(), buffer, d)));
+                    else
+                        sizes.push_back(
+                            OpFoldResult(rewriter.getIndexAttr(memrefType.getDimSize(d))));
+                    strides.push_back(rewriter.getIndexAttr(1));
+                }
+
+                return rewriter.create<memref::SubViewOp>(
+                    op.getLoc(), buffer, offsets, sizes, strides);
+            };
+
             for (int i = 0; i < (int)insVec.size(); ++i)
             {
                 auto in = insVec[i];
                 auto partitionInfo = arrayPartitionInfoInVec[i];
 
-                if (partitionInfo.strategy == partitionInfo.ROW_PARTITION && !isStencil)
+                if (partitionInfo.strategy != partitionInfo.NO_PARTITION && !isStencil)
                 {
-                    auto memrefType = dyn_cast<MemRefType>(in.getType());
-
-                    if (memrefType && memrefType.getRank() > 0)
+                    Value subview = createPartitionSubview(in, partitionInfo);
+                    if (subview)
                     {
-                        auto shape = memrefType.getShape();
-
-                        SmallVector<OpFoldResult> offsets, sizes, strides;
-
-                        offsets.push_back(dynamicBounds
-                                              ? OpFoldResult(startVal)
-                                              : OpFoldResult(rewriter.getIndexAttr(std::max<int64_t>(0, start))));
-                        for (size_t d = 1; d < shape.size(); ++d)
-                            offsets.push_back(rewriter.getIndexAttr(0));
-
-                        sizes.push_back(dynamicBounds ? OpFoldResult(chunkVal)
-                                                      : OpFoldResult(rewriter.getIndexAttr(chunk)));
-                        for (size_t d = 1; d < shape.size(); ++d)
-                            sizes.push_back(rewriter.getIndexAttr(shape[d]));
-
-                        for (size_t d = 0; d < shape.size(); ++d)
-                            strides.push_back(rewriter.getIndexAttr(1));
-
-                        auto subview = rewriter.create<memref::SubViewOp>(
-                            op.getLoc(), in, offsets, sizes, strides);
-
                         subViewIns.push_back(subview);
                         mapping.map(in, subview);
                         indicesRebased = true;
@@ -867,45 +935,43 @@ if (!sawStore || unsupportedStore) {
             }
 
             needBroadcast = false;
+            llvm::SmallVector<int64_t, 4> partialReduceIdx;
+            llvm::SmallVector<int64_t, 4> outputPartitionDims;
             for (int i = 0; i < (int)outsVec.size(); ++i)
             {
                 auto out = outsVec[i];
                 auto partitionInfo = arrayPartitionInfoOutVec[i];
 
-                if (partitionInfo.strategy == partitionInfo.ROW_PARTITION && !isStencil)
+                if (partialReduceOut[i])
                 {
-                    auto memrefType = cast<MemRefType>(out.getType());
-                    llvm::errs() << "Memref Type: " << memrefType << "\n";
-                    auto shape = memrefType.getShape();
-
-                    SmallVector<OpFoldResult> offsets, sizes, strides;
-
-                    offsets.push_back(dynamicBounds
-                                          ? OpFoldResult(startVal)
-                                          : OpFoldResult(rewriter.getIndexAttr(std::max<int64_t>(0, start))));
-                    for (size_t d = 1; d < shape.size(); ++d)
-                        offsets.push_back(rewriter.getIndexAttr(0));
-
-                    sizes.push_back(dynamicBounds ? OpFoldResult(chunkVal)
-                                                  : OpFoldResult(rewriter.getIndexAttr(chunk)));
-                    for (size_t d = 1; d < shape.size(); ++d)
-                        sizes.push_back(rewriter.getIndexAttr(shape[d]));
-
-                    for (size_t d = 0; d < shape.size(); ++d)
-                        strides.push_back(rewriter.getIndexAttr(1));
-
-                    auto subview = rewriter.create<memref::SubViewOp>(
-                        op.getLoc(), out, offsets, sizes, strides);
+                    // Accumulate into this shard's private buffer.  The buffer
+                    // spans the whole output and the body keeps global indices,
+                    // so no rebasing is needed for it.
+                    subViewOuts.push_back(privateOutBuffers[i]);
+                    mapping.map(out, privateOutBuffers[i]);
+                    partialReduceIdx.push_back(i);
+                    outputPartitionDims.push_back(-1);
+                }
+                else if (partitionInfo.strategy != partitionInfo.NO_PARTITION && !isStencil)
+                {
+                    Value subview = createPartitionSubview(out, partitionInfo);
+                    if (!subview)
+                    {
+                        op.emitError("failed to create output partition subview");
+                        return failure();
+                    }
 
                     subViewOuts.push_back(subview);
                     mapping.map(out, subview);
                     indicesRebased = true;
+                    outputPartitionDims.push_back(partitionInfo.partitionDimension);
                 }
 
                 else
                 {
                     subViewOuts.push_back(out);
                     mapping.map(out, out);
+                    outputPartitionDims.push_back(0);
                 }
 
                 if (mlir::dhir::doesOutputNeedBroadcast(op, out))
@@ -948,9 +1014,34 @@ if (!sawStore || unsupportedStore) {
             taskOp->setAttr("repId", repIdAttr);
             taskOp->setAttr("shardGroup", repIdAttr);
 
+            if (!partialReduceIdx.empty())
+                taskOp->setAttr("partialReduce",
+                                rewriter.getDenseI64ArrayAttr(partialReduceIdx));
+            taskOp->setAttr("outputPartitionDims",
+                            rewriter.getDenseI64ArrayAttr(outputPartitionDims));
+
             if (taskOp.getRegion().empty())
                 rewriter.createBlock(&taskOp.getRegion());
 
+            rewriter.setInsertionPointToStart(&taskOp.getRegion().front());
+
+            // Initialise the private buffers before the body runs: shard 0
+            // starts from the output as it stands, every other shard from zero.
+            // Their sum is therefore the sequential result.
+            for (int64_t reduceIdx : partialReduceIdx)
+            {
+                Value priv = privateOutBuffers[reduceIdx];
+                if (i == 0)
+                    rewriter.create<memref::CopyOp>(op.getLoc(), outsVec[reduceIdx], priv);
+                else
+                {
+                    llvm::SmallVector<Value, 4> zeroIndices;
+                    emitZeroFill(rewriter, priv, 0, zeroIndices);
+                }
+            }
+            // The zero-fill loops left the insertion point inside them; put it
+            // back at the head of the task body so the cloned body follows the
+            // initialisation.
             rewriter.setInsertionPointToStart(&taskOp.getRegion().front());
 
             //   rebased  -> [0,chunk)
@@ -1025,12 +1116,19 @@ if (!sawStore || unsupportedStore) {
                             unsigned dim = static_cast<unsigned>(access->first);
                             if (partitionAnalysis->getSimpleAffineIVOffset(
                                     results[dim], operandPos, map.getNumDims(), mapOffset)) {
-                                results[dim] = results[dim] + start;
+                                if (dynamicBounds) {
+                                    rewriter.setInsertionPoint(load);
+                                    Value globalOperand = rewriter.create<arith::AddIOp>(
+                                        load.getLoc(), operands[operandPos], startVal);
+                                    load->setOperand(1 + operandPos, globalOperand);
+                                } else {
+                                    results[dim] = results[dim] + start;
+                                }
                                 changed = true;
                                 break;
                             }
                         }
-                        if (changed)
+                        if (changed && !dynamicBounds)
                             load.setMap(AffineMap::get(map.getNumDims(), map.getNumSymbols(),
                                                        results, load.getContext()));
                         return;
@@ -1059,12 +1157,19 @@ if (!sawStore || unsupportedStore) {
                             unsigned dim = static_cast<unsigned>(access->first);
                             if (partitionAnalysis->getSimpleAffineIVOffset(
                                     results[dim], operandPos, map.getNumDims(), mapOffset)) {
-                                results[dim] = results[dim] + start;
+                                if (dynamicBounds) {
+                                    rewriter.setInsertionPoint(store);
+                                    Value globalOperand = rewriter.create<arith::AddIOp>(
+                                        store.getLoc(), operands[operandPos], startVal);
+                                    store->setOperand(2 + operandPos, globalOperand);
+                                } else {
+                                    results[dim] = results[dim] + start;
+                                }
                                 changed = true;
                                 break;
                             }
                         }
-                        if (changed)
+                        if (changed && !dynamicBounds)
                             store.setMap(AffineMap::get(map.getNumDims(), map.getNumSymbols(),
                                                         results, store.getContext()));
                         return;
@@ -1081,8 +1186,10 @@ if (!sawStore || unsupportedStore) {
                         unsigned dim = static_cast<unsigned>(access->first);
                         Value index = load.getIndices()[dim];
                         rewriter.setInsertionPoint(load);
-                        Value offset = rewriter.create<arith::ConstantIndexOp>(
-                            load.getLoc(), start);
+                        Value offset = dynamicBounds
+                            ? startVal
+                            : Value(rewriter.create<arith::ConstantIndexOp>(
+                                  load.getLoc(), start));
                         Value rebased = rewriter.create<arith::AddIOp>(
                             load.getLoc(), index, offset);
                         load->setOperand(1 + dim, rebased);
@@ -1100,8 +1207,10 @@ if (!sawStore || unsupportedStore) {
                         unsigned dim = static_cast<unsigned>(access->first);
                         Value index = store.getIndices()[dim];
                         rewriter.setInsertionPoint(store);
-                        Value offset = rewriter.create<arith::ConstantIndexOp>(
-                            store.getLoc(), start);
+                        Value offset = dynamicBounds
+                            ? startVal
+                            : Value(rewriter.create<arith::ConstantIndexOp>(
+                                  store.getLoc(), start));
                         Value rebased = rewriter.create<arith::AddIOp>(
                             store.getLoc(), index, offset);
                         // memref.store operands are value, memref, then indices;

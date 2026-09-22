@@ -96,18 +96,16 @@ namespace mlir
                     return info;
                 }
 
-                // A dimension-0 subview needs concrete sizes for every trailing
-                // dimension. Keeping such an operand whole is still correct; the
-                // per-access rebaser will restore the global IV where needed.
-                for (int dim = 1; dim < rank; ++dim)
-                {
-                    if (memrefType.isDynamicDim(dim))
-                    {
-                        info.partitionReason =
-                            "dynamic trailing dimensions cannot form a static row slice";
-                        return info;
-                    }
-                }
+                // Dynamic trailing dimensions do NOT block a partition.  A
+                // dim-0 row slice of a memref<?x?xf32> is legal: the shard
+                // covers [start,end) rows and every trailing extent is a
+                // runtime value carried on the subview.  The access analysis
+                // below decides which dimension (if any) the partitioned IV
+                // drives; trailing dims are only used as subview *sizes*, which
+                // are emitted from memref.dim at lowering time, never as
+                // compile-time extents.  (Previously this rejected any
+                // memref<?x?xf32> before looking at the accesses, so a legal
+                // row partition was refused purely on the type shape.)
 
                 if (!partitionedIV)
                 {
@@ -193,12 +191,10 @@ namespace mlir
                 }
                 else if (partitionDim == 1 && rank == 2)
                 {
-                    // The MPI lowering gathers contiguous row slices through raw
-                    // pointers. A column view is strided, so advertising
-                    // COL_PARTITION here would be a strategy the lowerer cannot emit.
-                    info.partitionReason = isInput
-                        ? "column-accessed input is replicated; strided transfers are deferred"
-                        : "column partitioning requires strided transfers and is deferred";
+                    info.strategy = ArrayPartitioningInfo::COL_PARTITION;
+                    info.partitionDimension = 1;
+                    info.partitionReason =
+                        "all accesses use the partitioned IV on dimension 1";
                 }
                 else
                 {
@@ -208,6 +204,8 @@ namespace mlir
 
                 if (info.strategy == ArrayPartitioningInfo::ROW_PARTITION)
                     llvm::errs() << "→ ROW_PARTITION (" << info.partitionReason << ")\n";
+                else if (info.strategy == ArrayPartitioningInfo::COL_PARTITION)
+                    llvm::errs() << "→ COL_PARTITION (" << info.partitionReason << ")\n";
                 else
                     llvm::errs() << "→ NO_PARTITION (" << info.partitionReason << ")\n";
 

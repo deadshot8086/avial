@@ -386,6 +386,79 @@ static Value createRuntimeTopology(ModuleOp module, ConversionPatternRewriter &r
     return topology;
 }
 
+// Allocate a buffer with the same type and runtime extents as `like`.  Used as
+// the receive side of a reduction combine, so it must match element for element
+// or the transfer count would disagree with the sender's.
+static Value createMirrorBuffer(OpBuilder &builder, Location loc, Value like)
+{
+    auto type = cast<MemRefType>(like.getType());
+    SmallVector<Value> dynSizes;
+    for (unsigned dim = 0; dim < (unsigned)type.getRank(); ++dim)
+        if (type.isDynamicDim(dim))
+            dynSizes.push_back(builder.create<memref::DimOp>(loc, like, (int64_t)dim));
+    return builder.create<memref::AllocOp>(loc, type, dynSizes);
+}
+
+// dst[i] += src[i] over the whole extent of both.
+//
+// Integer accumulators narrower than 32 bits are widened for the sum and clamped
+// to the unsigned maximum of their own width before being stored back: a bin
+// counter saturates, and summing two shard-local saturating counters in the
+// narrow type would wrap instead.  Wider integers and floats add directly.
+static void emitElementwiseAccumulate(OpBuilder &builder, Location loc,
+                                      Value dst, Value src)
+{
+    auto dstType = cast<MemRefType>(dst.getType());
+    Type elemType = dstType.getElementType();
+
+    SmallVector<Value> indices;
+    std::function<void(unsigned)> emitDim = [&](unsigned dim) {
+        if (dim == (unsigned)dstType.getRank())
+        {
+            Value current = builder.create<memref::LoadOp>(loc, dst, indices);
+            Value incoming = builder.create<memref::LoadOp>(loc, src, indices);
+            Value sum;
+            if (isa<FloatType>(elemType))
+            {
+                sum = builder.create<arith::AddFOp>(loc, current, incoming);
+            }
+            else if (elemType.getIntOrFloatBitWidth() < 32)
+            {
+                unsigned width = elemType.getIntOrFloatBitWidth();
+                Type wideType = builder.getIntegerType(32);
+                Value currentWide = builder.create<arith::ExtUIOp>(loc, wideType, current);
+                Value incomingWide = builder.create<arith::ExtUIOp>(loc, wideType, incoming);
+                Value wideSum = builder.create<arith::AddIOp>(loc, currentWide, incomingWide);
+                Value maxValue = builder.create<arith::ConstantIntOp>(
+                    loc, (int64_t(1) << width) - 1, 32);
+                Value clamped = builder.create<arith::MinUIOp>(loc, wideSum, maxValue);
+                sum = builder.create<arith::TruncIOp>(loc, elemType, clamped);
+            }
+            else
+            {
+                sum = builder.create<arith::AddIOp>(loc, current, incoming);
+            }
+            builder.create<memref::StoreOp>(loc, sum, dst, indices);
+            return;
+        }
+
+        Value lower = builder.create<arith::ConstantIndexOp>(loc, 0);
+        Value upper;
+        if (dstType.isDynamicDim(dim))
+            upper = builder.create<memref::DimOp>(loc, dst, (int64_t)dim);
+        else
+            upper = builder.create<arith::ConstantIndexOp>(loc, dstType.getDimSize(dim));
+        Value step = builder.create<arith::ConstantIndexOp>(loc, 1);
+        auto forOp = builder.create<scf::ForOp>(loc, lower, upper, step);
+        builder.setInsertionPointToStart(forOp.getBody());
+        indices.push_back(forOp.getInductionVar());
+        emitDim(dim + 1);
+        indices.pop_back();
+        builder.setInsertionPointAfter(forOp);
+    };
+    emitDim(0);
+}
+
 struct ConvertScheduleOp : public OpConversionPattern<mlir::dhir::ScheduleOp>
 {
     using OpConversionPattern::OpConversionPattern;
@@ -731,9 +804,30 @@ struct ConvertScheduleOp : public OpConversionPattern<mlir::dhir::ScheduleOp>
                 int targetNodeIdx = deviceToIndex[targetDevice];
 
                 llvm::ArrayRef outRanges = taskOp.getOutRanges();
+                llvm::SmallVector<int64_t, 4> outputPartitionDims(
+                    task->writes.size(), 0);
+                if (auto dimsAttr = taskOp->getAttrOfType<mlir::DenseI64ArrayAttr>(
+                        "outputPartitionDims"))
+                {
+                    if (dimsAttr.size() != task->writes.size())
+                    {
+                        taskOp.emitError("outputPartitionDims must match task outputs");
+                        return failure();
+                    }
+                    outputPartitionDims.assign(dimsAttr.asArrayRef().begin(),
+                                               dimsAttr.asArrayRef().end());
+                }
                 
+                // Which of this task's write operands are reduction targets
+                // rather than row slabs.  Recorded by the replicate lowering.
+                llvm::SmallVector<int64_t, 4> partialReduceWriteIdx;
+                if (auto reduceAttr =
+                        taskOp->getAttrOfType<mlir::DenseI64ArrayAttr>("partialReduce"))
+                    partialReduceWriteIdx.assign(reduceAttr.asArrayRef().begin(),
+                                                 reduceAttr.asArrayRef().end());
+
                 // Get the base buffer from mapping (now subviews are in mapping!)
-                for (auto writeOp : task->writes)
+                for (auto [writeIndex, writeOp] : llvm::enumerate(task->writes))
                 {
                     Value buffer = mapping.lookupOrNull(writeOp);
 
@@ -741,6 +835,67 @@ struct ConvertScheduleOp : public OpConversionPattern<mlir::dhir::ScheduleOp>
                     {
                         llvm::errs() << "ERROR: Buffer not found in mapping\n";
                         return failure();
+                    }
+
+                    // A reduction shard accumulated into a private buffer.  The
+                    // combine is a sum: shard 0's buffer already holds the
+                    // output as it was plus its own partials, so the root copies
+                    // it over the real output and adds every other shard's
+                    // buffer to it.  Summing is exactly the sequential result
+                    // for both read-modify-write accumulation and disjoint
+                    // overwrite.
+                    if (llvm::is_contained(partialReduceWriteIdx, (int64_t)writeIndex))
+                    {
+                        Value actualOut = mapping.lookupOrDefault(
+                            taskOp.getActualBuffer()[writeIndex]);
+
+                        Value reduceRootIdx = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+                        Value reduceRootRank = rewriter.create<memref::LoadOp>(
+                            loc, nodeToRankMap, ValueRange{reduceRootIdx});
+                        Value isReduceRoot = rewriter.create<arith::CmpIOp>(
+                            loc, rewriter.getI1Type(), arith::CmpIPredicate::eq,
+                            rank.getResult(0), reduceRootRank);
+
+                        if (targetNodeIdx == 0)
+                        {
+                            auto copyIf = rewriter.create<mlir::scf::IfOp>(
+                                loc, mlir::TypeRange{}, isReduceRoot, false);
+                            copyIf.getThenBodyBuilder(rewriter.getListener())
+                                .create<memref::CopyOp>(loc, buffer, actualOut);
+                        }
+                        else
+                        {
+                            Value reduceOwnerIdx =
+                                rewriter.create<arith::ConstantIndexOp>(loc, targetNodeIdx);
+                            Value reduceOwnerRank = rewriter.create<memref::LoadOp>(
+                                loc, nodeToRankMap, ValueRange{reduceOwnerIdx});
+                            Value isReduceOwner = rewriter.create<arith::CmpIOp>(
+                                loc, rewriter.getI1Type(), arith::CmpIPredicate::eq,
+                                rank.getResult(0), reduceOwnerRank);
+
+                            auto recvIf = rewriter.create<mlir::scf::IfOp>(
+                                loc, mlir::TypeRange{}, isReduceRoot, true);
+                            OpBuilder thenBuilder = recvIf.getThenBodyBuilder(rewriter.getListener());
+                            Value incoming = createMirrorBuffer(thenBuilder, loc, buffer);
+                            thenBuilder.create<mlir::mpi::RecvOp>(
+                                loc, retVal, incoming, tag.getResult(),
+                                reduceOwnerRank, comm->getResult(0));
+                            emitElementwiseAccumulate(thenBuilder, loc, actualOut, incoming);
+
+                            OpBuilder elseBuilder = recvIf.getElseBodyBuilder(rewriter.getListener());
+                            auto sendIf = elseBuilder.create<mlir::scf::IfOp>(
+                                loc, mlir::TypeRange{}, isReduceOwner, false);
+                            sendIf.getThenBodyBuilder(elseBuilder.getListener())
+                                .create<mlir::mpi::SendOp>(
+                                    loc, retVal, buffer, tag.getResult(),
+                                    reduceRootRank, comm->getResult(0));
+                        }
+
+                        BoolAttr reduceBroadcast =
+                            mlir::dyn_cast<mlir::BoolAttr>(taskOp->getAttr("needBroadcast"));
+                        if (reduceBroadcast && reduceBroadcast.getValue())
+                            toBroadcast.push_back(actualOut);
+                        continue;
                     }
 
                     Value sourceBuffer = buffer;
@@ -756,6 +911,12 @@ struct ConvertScheduleOp : public OpConversionPattern<mlir::dhir::ScheduleOp>
 
                     auto sourceType = cast<MemRefType>(sourceBuffer.getType());
                     int64_t sourceRank = sourceType.getRank();
+                    int64_t partitionDim = outputPartitionDims[writeIndex];
+                    if (partitionDim < 0 || partitionDim >= sourceRank)
+                    {
+                        taskOp.emitError("invalid output partition dimension for gather");
+                        return failure();
+                    }
 
                     SmallVector<OpFoldResult> offsets;
                     SmallVector<OpFoldResult> sizes;
@@ -785,54 +946,28 @@ struct ConvertScheduleOp : public OpConversionPattern<mlir::dhir::ScheduleOp>
                         rangeSize = rewriter.getIndexAttr(outRanges[1] - outRanges[0]);
                     }
 
-                    if (sourceRank == 1)
-                    {
-                        offsets.push_back(rangeStart);
-                        sizes.push_back(rangeSize);
-                        strides.push_back(rewriter.getIndexAttr(1));
-                    }
-                    else if (sourceRank == 2)
-                    {
-                        auto shape = sourceType.getShape();
-                        offsets = {
-                            rangeStart,
-                            rewriter.getIndexAttr(0)
-                        };
-                        sizes = {
-                            rangeSize,
-                            rewriter.getIndexAttr(shape[1])
-                        };
-                        strides = {
-                            rewriter.getIndexAttr(1),
-                            rewriter.getIndexAttr(1)
-                        };
-                    }
-                    else if (sourceRank == 3)
-                    {
-                        // Partition along dim 0 (i), communicate the [start, end) slice.
-                        // dims 1 (j) and 2 (k) are transferred in full, matching the
-                        // same pattern used for rank-2 above.
-                        auto shape = sourceType.getShape();
-                        offsets = {
-                            rangeStart,
-                            rewriter.getIndexAttr(0),
-                            rewriter.getIndexAttr(0)
-                        };
-                        sizes = {
-                            rangeSize,
-                            rewriter.getIndexAttr(shape[1]),
-                            rewriter.getIndexAttr(shape[2])
-                        };
-                        strides = {
-                            rewriter.getIndexAttr(1),
-                            rewriter.getIndexAttr(1),
-                            rewriter.getIndexAttr(1)
-                        };
-                    }
-                    else
+                    if (sourceRank < 1 || sourceRank > 3)
                     {
                         llvm::errs() << "[Error] Unsupported Memref rank\n";
                         return failure();
+                    }
+                    for (int64_t d = 0; d < sourceRank; ++d)
+                    {
+                        if (d == partitionDim)
+                        {
+                            offsets.push_back(rangeStart);
+                            sizes.push_back(rangeSize);
+                        }
+                        else
+                        {
+                            offsets.push_back(rewriter.getIndexAttr(0));
+                            sizes.push_back(sourceType.isDynamicDim(d)
+                                ? OpFoldResult(rewriter.create<memref::DimOp>(
+                                      loc, sourceBuffer, d))
+                                : OpFoldResult(rewriter.getIndexAttr(
+                                      sourceType.getDimSize(d))));
+                        }
+                        strides.push_back(rewriter.getIndexAttr(1));
                     }
 
                     Value subBuffer = rewriter.create<memref::SubViewOp>(

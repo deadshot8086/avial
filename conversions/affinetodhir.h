@@ -151,6 +151,15 @@ namespace mlir
                 llvm::SmallVector<mlir::affine::AffineForOp> independentLoops;
                 for (auto innerLoop : allInnerLoops)
                 {
+                    // iter_args are invisible to the memory-access dependence
+                    // check but are a real loop-carried value dependence: each
+                    // iteration feeds the next.  Partitioning such a loop would
+                    // need the previous shard's state, so leave it alone.
+                    if (innerLoop.getNumRegionIterArgs() != 0)
+                    {
+                        llvm::errs() << "Inner loop carries iter_args; not wrapping in ReplicateOp\n";
+                        continue;
+                    }
                     if (isLoopIndependent(innerLoop))
                     {
                         independentLoops.push_back(innerLoop);
@@ -266,8 +275,19 @@ namespace mlir
                                 }
                                 else if (outerDep == 0) // No dependence in outer loop
                                 {
-                                    // Fully parallelizable - wrap with ReplicateOp
-                                    toReplicateVector.push_back(forOp);
+                                    // Fully parallelizable - wrap with ReplicateOp.
+                                    // iter_args are not visible to the memory-access
+                                    // dependence check, yet they carry a value from
+                                    // one iteration to the next, so a loop that has
+                                    // them is not parallelizable: it is left
+                                    // unpartitioned and then runs, unchanged, on
+                                    // every rank.
+                                    if (forOp.getNumRegionIterArgs() != 0)
+                                    {
+                                        llvm::errs() << "Loop carries iter_args; leaving it unpartitioned\n";
+                                    }
+                                    else
+                                        toReplicateVector.push_back(forOp);
                                 }
                                 else // outerDep == 2, dependence check failed
                                 {

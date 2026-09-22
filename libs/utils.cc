@@ -332,10 +332,24 @@ void generateBroadcastCommunication(
     llvm::errs() << "\n=== Generating Broadcast Communication ===\n";
     llvm::errs() << "Number of buffers to broadcast: " << toBroadcast.size() << "\n";
 
-    // Calculate total size needed for broadcasting
-    // Sum all the first dimensions of the buffers in toBroadcast
-    int64_t totalFirstDim = 0;
-    int64_t secondDim = -1;
+    // Helper: the runtime extent of `buffer` on dim `d`, as an index Value.
+    // A dynamic dim reads the descriptor (memref.dim); the sentinel must never
+    // be used as a compile-time extent.  A static dim is a constant.
+    std::function<Value(Value, unsigned)> bufferExtent = [&](Value buffer, unsigned d) -> Value {
+        auto ty = cast<MemRefType>(buffer.getType());
+        if (!ty.isDynamicDim(d))
+            return rewriter.create<arith::ConstantIndexOp>(
+                loc, ty.getDimSize(d));
+        return rewriter.create<memref::DimOp>(loc, buffer, (int64_t)d);
+    };
+
+    // Total rows spanned by the (contiguous) row ranges in toBroadcast, and the
+    // common trailing extent, both as runtime index values so dynamic dims are
+    // sized from the descriptor.  All subBuffers subview the same source, so
+    // they agree on trailing extents; dim-1 is taken from the first buffer.
+    Value totalFirstDimVal = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+    int64_t staticSecondDim = -1;
+    bool dynamicSecondDim = false;
 
     for (Value subBuffer : toBroadcast)
     {
@@ -352,25 +366,26 @@ void generateBroadcastCommunication(
         auto shape = memrefType.getShape();
         if (shape.size() >= 2)
         {
-            totalFirstDim += shape[0];
-            if (secondDim == -1)
+            totalFirstDimVal = rewriter.create<arith::AddIOp>(
+                loc, totalFirstDimVal, bufferExtent(subBuffer, 0));
+            if (memrefType.isDynamicDim(1))
             {
-                secondDim = shape[1];
+                dynamicSecondDim = true;
             }
-            else if (secondDim != shape[1])
+            else if (!dynamicSecondDim)
             {
-                llvm::errs() << "Warning: Inconsistent second dimension in buffers\n";
+                if (staticSecondDim == -1)
+                    staticSecondDim = shape[1];
+                else if (staticSecondDim != shape[1])
+                    llvm::errs() << "Warning: Inconsistent second dimension in buffers\n";
             }
         }
-
         else if (shape.size() < 2)
         {
-            totalFirstDim += shape[0];
+            totalFirstDimVal = rewriter.create<arith::AddIOp>(
+                loc, totalFirstDimVal, bufferExtent(subBuffer, 0));
         }
     }
-
-    llvm::errs() << "Total first dimension: " << totalFirstDim << "\n";
-    llvm::errs() << "Second dimension: " << secondDim << "\n";
 
     // Get the source buffer (unwrap from first subview)
     Value sourceBuffer = toBroadcast[0];
@@ -387,7 +402,8 @@ void generateBroadcastCommunication(
 
     // Get offset from the first buffer
 
-    if (secondDim != -1)
+    if (auto bcastType = mlir::dyn_cast<MemRefType>(toBroadcast[0].getType());
+        bcastType && bcastType.getRank() >= 2)
     {
         if (auto firstSubview = toBroadcast[0].getDefiningOp<memref::SubViewOp>())
         {
@@ -399,10 +415,15 @@ void generateBroadcastCommunication(
             offsets = {rewriter.getIndexAttr(0), rewriter.getIndexAttr(0)};
         }
 
+        // Trailing extent: the first buffer's dim-1, dynamic or static.
+        OpFoldResult secondDimVal = dynamicSecondDim
+            ? OpFoldResult(bufferExtent(toBroadcast[0], 1))
+            : OpFoldResult(rewriter.getIndexAttr(staticSecondDim));
+
         // Set sizes: total first dimension and the common second dimension
         sizes = {
-            rewriter.getIndexAttr(totalFirstDim),
-            rewriter.getIndexAttr(secondDim)};
+            OpFoldResult(totalFirstDimVal),
+            secondDimVal};
 
         // Default strides
         strides = {
@@ -413,7 +434,7 @@ void generateBroadcastCommunication(
     else
     {
         offsets.push_back(rewriter.getIndexAttr(0));
-        sizes.push_back(rewriter.getIndexAttr(totalFirstDim));
+        sizes.push_back(OpFoldResult(totalFirstDimVal));
         strides.push_back(rewriter.getIndexAttr(1));
     }
 

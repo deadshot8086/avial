@@ -482,7 +482,12 @@ public:
 };
 
 std::unique_ptr<MPIImplTraits> MPIImplTraits::get(ModuleOp &moduleOp) {
-  auto attr = dlti::query(*&moduleOp, {"MPI:Implementation"}, true);
+  // Don't emit a hard diagnostic when the attribute is absent: a module that
+  // only carries dhir.target_devices (no top-level "MPI:Implementation" DLTI
+  // entry) is still valid and is exactly what the DHIR frontend produces.  The
+  // failure path below already defaults to MPICH, so a missing attribute must
+  // not fail the whole lowering.
+  auto attr = dlti::query(*&moduleOp, {"MPI:Implementation"}, false);
   if (failed(attr))
     return std::make_unique<MPICHImplTraits>(moduleOp);
   auto strAttr = dyn_cast<StringAttr>(attr.value());
@@ -492,6 +497,129 @@ std::unique_ptr<MPIImplTraits> MPIImplTraits::get(ModuleOp &moduleOp) {
     moduleOp.emitWarning() << "Unknown \"MPI:Implementation\" value in DLTI ("
                            << strAttr.getValue() << "), defaulting to MPICH";
   return std::make_unique<MPICHImplTraits>(moduleOp);
+}
+
+struct MPITransferDescriptor {
+  Value dataPtr;
+  Value count;
+  Value dataType;
+  SmallVector<Value> derivedTypePtrs;
+};
+
+static FailureOr<int64_t> getElementByteWidth(Location loc, Type type) {
+  if (!type.isIntOrFloat()) {
+    mlir::emitError(loc) << "cannot construct an MPI datatype for element type "
+                         << type;
+    return failure();
+  }
+
+  unsigned bitWidth = type.getIntOrFloatBitWidth();
+  if (bitWidth == 0 || bitWidth % 8 != 0) {
+    mlir::emitError(loc) << "MPI derived datatypes require byte-addressable "
+                            "element types, got "
+                         << type;
+    return failure();
+  }
+  return static_cast<int64_t>(bitWidth / 8);
+}
+
+static void freeDerivedDataTypes(Location loc,
+                                 ConversionPatternRewriter &rewriter,
+                                 ModuleOp moduleOp,
+                                 ArrayRef<Value> derivedTypePtrs) {
+  if (derivedTypePtrs.empty())
+    return;
+
+  Type i32 = rewriter.getI32Type();
+  Type ptrType = LLVM::LLVMPointerType::get(rewriter.getContext());
+  auto freeType = LLVM::LLVMFunctionType::get(i32, {ptrType});
+  LLVM::LLVMFuncOp freeDecl = getOrDefineFunction(
+      moduleOp, loc, rewriter, "MPI_Type_free", freeType);
+  for (Value typePtr : llvm::reverse(derivedTypePtrs))
+    rewriter.create<LLVM::CallOp>(loc, freeDecl, ValueRange{typePtr});
+}
+
+// Build the pointer/count/datatype triple used by MPI_Send and MPI_Recv. A
+// statically contiguous memref uses the ordinary element datatype. For a
+// strided view, nested hvectors describe each memref dimension using the
+// runtime descriptor sizes and strides. This handles both dynamic row slabs
+// and column slices without packing them into a temporary buffer.
+static FailureOr<MPITransferDescriptor> getTransferDescriptor(
+    Location loc, ConversionPatternRewriter &rewriter, ModuleOp moduleOp,
+    Value originalMemRef, Value memRef, Type elemType,
+    MPIImplTraits &mpiTraits) {
+  auto memRefType = dyn_cast<MemRefType>(originalMemRef.getType());
+  if (!memRefType || isProvablyContiguous(memRefType)) {
+    auto rawPtrAndSize = getRawPtrAndSize(
+        loc, rewriter, originalMemRef, memRef, elemType);
+    if (failed(rawPtrAndSize))
+      return failure();
+    auto [dataPtr, count] = *rawPtrAndSize;
+    return MPITransferDescriptor{
+        dataPtr, count, mpiTraits.getDataType(loc, rewriter, elemType), {}};
+  }
+
+  auto structType = dyn_cast<LLVM::LLVMStructType>(memRef.getType());
+  if (!structType || structType.getBody().size() <= 4) {
+    mlir::emitError(loc)
+        << "cannot extract runtime strides from converted memref type "
+        << memRef.getType();
+    return failure();
+  }
+
+  FailureOr<int64_t> elementBytes = getElementByteWidth(loc, elemType);
+  if (failed(elementBytes))
+    return failure();
+
+  Type ptrType = LLVM::LLVMPointerType::get(rewriter.getContext());
+  Type i32 = rewriter.getI32Type();
+  MemRefDescriptor desc(memRef);
+  Value dataPtr = desc.alignedPtr(rewriter, loc);
+  Value offset = desc.offset(rewriter, loc);
+  dataPtr = rewriter.create<LLVM::GEPOp>(loc, ptrType, elemType, dataPtr,
+                                         offset);
+
+  Value dataType = mpiTraits.getDataType(loc, rewriter, elemType);
+  Type dataTypeType = dataType.getType();
+  auto hvectorType = LLVM::LLVMFunctionType::get(
+      i32, {i32, i32, rewriter.getI64Type(), dataTypeType, ptrType});
+  LLVM::LLVMFuncOp hvectorDecl = getOrDefineFunction(
+      moduleOp, loc, rewriter, "MPI_Type_create_hvector", hvectorType);
+  auto commitType = LLVM::LLVMFunctionType::get(i32, {ptrType});
+  LLVM::LLVMFuncOp commitDecl = getOrDefineFunction(
+      moduleOp, loc, rewriter, "MPI_Type_commit", commitType);
+
+  Value one = rewriter.create<LLVM::ConstantOp>(loc, i32, 1);
+  SmallVector<Value> derivedTypePtrs;
+  for (int dim = memRefType.getRank() - 1; dim >= 0; --dim) {
+    Value dimensionSize = desc.size(rewriter, loc, dim);
+    Value dimensionCount =
+        rewriter.create<LLVM::TruncOp>(loc, i32, dimensionSize);
+    Value strideElements = desc.stride(rewriter, loc, dim);
+    Value byteWidth = rewriter.create<LLVM::ConstantOp>(
+        loc, strideElements.getType(), *elementBytes);
+    Value byteStride =
+        rewriter.create<LLVM::MulOp>(loc, strideElements, byteWidth);
+    Value typePtr = rewriter
+                        .create<LLVM::AllocaOp>(loc, ptrType, dataTypeType, one)
+                        .getRes();
+
+    rewriter.create<LLVM::CallOp>(
+        loc, hvectorDecl,
+        ValueRange{dimensionCount, one, byteStride, dataType, typePtr});
+    dataType =
+        rewriter.create<LLVM::LoadOp>(loc, dataTypeType, typePtr).getRes();
+    derivedTypePtrs.push_back(typePtr);
+  }
+
+  Value finalTypePtr = derivedTypePtrs.back();
+  rewriter.create<LLVM::CallOp>(loc, commitDecl, ValueRange{finalTypePtr});
+  dataType = rewriter
+                 .create<LLVM::LoadOp>(loc, dataTypeType, finalTypePtr)
+                 .getRes();
+
+  return MPITransferDescriptor{dataPtr, one, dataType,
+                               std::move(derivedTypePtrs)};
 }
 
 //===----------------------------------------------------------------------===//
@@ -811,13 +939,15 @@ struct SendOpLowering : public ConvertOpToLLVMPattern<mpi::SendOp> {
     auto moduleOp = op->getParentOfType<ModuleOp>();
 
     // get MPI_COMM_WORLD, dataType and pointer
-    auto rawPtrAndSize =
-        getRawPtrAndSize(loc, rewriter, op.getRef(), adaptor.getRef(), elemType);
-    if (failed(rawPtrAndSize))
-      return failure();
-    auto [dataPtr, size] = *rawPtrAndSize;
     auto mpiTraits = MPIImplTraits::get(moduleOp);
-    Value dataType = mpiTraits->getDataType(loc, rewriter, elemType);
+    auto transfer = getTransferDescriptor(loc, rewriter, moduleOp, op.getRef(),
+                                          adaptor.getRef(), elemType,
+                                          *mpiTraits);
+    if (failed(transfer))
+      return failure();
+    Value dataPtr = transfer->dataPtr;
+    Value size = transfer->count;
+    Value dataType = transfer->dataType;
     Value comm = mpiTraits->castComm(loc, rewriter, adaptor.getComm());
 
     // LLVM Function type representing `i32 MPI_send(data, count, datatype, dst,
@@ -833,6 +963,8 @@ struct SendOpLowering : public ConvertOpToLLVMPattern<mpi::SendOp> {
         loc, funcDecl,
         ValueRange{dataPtr, size, dataType, adaptor.getDest(), adaptor.getTag(),
                    comm});
+    freeDerivedDataTypes(loc, rewriter, moduleOp,
+                         transfer->derivedTypePtrs);
     if (op.getRetval())
       rewriter.replaceOp(op, funcCall.getResult());
     else
@@ -866,13 +998,15 @@ struct RecvOpLowering : public ConvertOpToLLVMPattern<mpi::RecvOp> {
     auto moduleOp = op->getParentOfType<ModuleOp>();
 
     // get MPI_COMM_WORLD, dataType, status_ignore and pointer
-    auto rawPtrAndSize =
-        getRawPtrAndSize(loc, rewriter, op.getRef(), adaptor.getRef(), elemType);
-    if (failed(rawPtrAndSize))
-      return failure();
-    auto [dataPtr, size] = *rawPtrAndSize;
     auto mpiTraits = MPIImplTraits::get(moduleOp);
-    Value dataType = mpiTraits->getDataType(loc, rewriter, elemType);
+    auto transfer = getTransferDescriptor(loc, rewriter, moduleOp, op.getRef(),
+                                          adaptor.getRef(), elemType,
+                                          *mpiTraits);
+    if (failed(transfer))
+      return failure();
+    Value dataPtr = transfer->dataPtr;
+    Value size = transfer->count;
+    Value dataType = transfer->dataType;
     Value comm = mpiTraits->castComm(loc, rewriter, adaptor.getComm());
     Value statusIgnore = rewriter.create<LLVM::ConstantOp>(
         loc, i64, mpiTraits->getStatusIgnore());
@@ -893,6 +1027,8 @@ struct RecvOpLowering : public ConvertOpToLLVMPattern<mpi::RecvOp> {
         loc, funcDecl,
         ValueRange{dataPtr, size, dataType, adaptor.getSource(),
                    adaptor.getTag(), comm, statusIgnore});
+    freeDerivedDataTypes(loc, rewriter, moduleOp,
+                         transfer->derivedTypePtrs);
     if (op.getRetval())
       rewriter.replaceOp(op, funcCall.getResult());
     else
