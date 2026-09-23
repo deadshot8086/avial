@@ -35,6 +35,7 @@
 #include "mlir/Conversion/SCFToGPU/SCFToGPUPass.h"
 
 #include "analysis/depGraph.h"
+#include "analysis/syncHoisting.h"
 
 #include "mlir/Dialect/DLTI/DLTI.h"
 
@@ -648,12 +649,124 @@ struct ConvertScheduleOp : public OpConversionPattern<mlir::dhir::ScheduleOp>
             return cloned;
         };
 
-        // Lower one level: task bodies, barrier, gather, broadcast. Emitted at
+        // ------------------------------------------------------------------
+        // Deferred synchronization.
+        //
+        // A shard nested in a serial loop is synced once per iteration because
+        // its output may feed the next one.  When the replicate lowering has
+        // proved the shard slab-local (it sets `deferSync`; see
+        // analysis/syncHoisting.h) that is pure waste: the rank only touches
+        // its own slab, so one sync after the loop is enough.  The loop op is
+        // not addressable while its body is built -- scf.for's body builder
+        // runs off an OperationState -- so a frame records the body *block*,
+        // collects the levels owing a sync, and is flushed once the rebuilt
+        // loop materializes.
+        // ------------------------------------------------------------------
+        struct DeferFrame
+        {
+            Operation *originalLoop = nullptr; // the loop in the schedule IR
+            Block *newBody = nullptr;          // the block being filled
+            llvm::SmallVector<size_t> levels;  // levels owing a sync
+        };
+        llvm::SmallVector<DeferFrame> deferFrames;
+
+        // Is `value` defined in `block`, or in a region nested inside it? Asked
+        // while `block` is still being filled, so it climbs blocks rather than
+        // asking the not-yet-created loop op for its region.
+        auto definedInsideBlock = [](Value value, Block *block) -> bool {
+            if (!block || !value)
+                return false;
+            Block *cur = nullptr;
+            if (auto arg = dyn_cast<BlockArgument>(value))
+                cur = arg.getOwner();
+            else if (Operation *def = value.getDefiningOp())
+                cur = def->getBlock();
+            while (cur)
+            {
+                if (cur == block)
+                    return true;
+                Operation *parent = cur->getParentOp();
+                cur = parent ? parent->getBlock() : nullptr;
+            }
+            return false;
+        };
+
+        // Could `value` be rebuilt after the loop whose body is `block`? Only
+        // pure computation qualifies: a load could observe a later store, and a
+        // value that bottoms out in the loop's induction variable or one of its
+        // iteration arguments has no meaning outside the loop at all.
+        std::function<bool(Value, Block *)> canRematerialize =
+            [&](Value value, Block *block) -> bool {
+            if (!definedInsideBlock(value, block))
+                return true;
+            Operation *def = value.getDefiningOp();
+            if (!def || !mlir::isPure(def))
+                return false;
+            for (Value operand : def->getOperands())
+                if (!canRematerialize(operand, block))
+                    return false;
+            return true;
+        };
+
+        // May this level's sync move out of `frame`'s loop? Slab locality was
+        // settled by the replicate lowering; what is checked here is that the
+        // emission can follow — the level defers as a whole, its shape is one a
+        // single post-loop exchange still models, and every value the gather
+        // needs survives outside the loop.
+        auto canHoistLevelSync = [&](const std::vector<TaskOpInfo *> &level,
+                                     const DeferFrame &frame) -> bool {
+            if (level.empty() || !frame.newBody || !frame.originalLoop)
+                return false;
+
+            for (TaskOpInfo *task : level)
+            {
+                auto taskOp = dyn_cast<dhir::TaskOp>(task->op);
+                // The barrier and the broadcast are per level, so a level that
+                // is not uniformly deferrable stays where it is.
+                if (!taskOp || !taskOp->hasAttr("deferSync"))
+                    return false;
+
+                // A reduction re-seeds its private buffer every iteration and a
+                // stencil's boundary exchange feeds the next step; neither is
+                // reproduced by a single post-loop exchange.
+                if (taskOp->hasAttr("partialReduce") || taskOp->hasAttr("stencil"))
+                    return false;
+
+                // The sync must land after the very loop the legality walk
+                // inspected. Levels are released in topological order, which
+                // can be a different place than where the task sits.
+                if (mlir::dhir::nearestEnclosingSerialLoop(task->op) !=
+                    frame.originalLoop)
+                    return false;
+
+                for (Value rangeOperand : taskOp.getRangeOperands())
+                    if (!canRematerialize(mapping.lookupOrDefault(rangeOperand),
+                                          frame.newBody))
+                        return false;
+
+                for (Value writeOp : task->writes)
+                {
+                    Value buffer = mapping.lookupOrNull(writeOp);
+                    if (!buffer)
+                        return false;
+                    // The gather addresses the base allocation the shard view
+                    // was carved from; a base created inside the loop dies with
+                    // the iteration.
+                    while (auto subview = dyn_cast_or_null<memref::SubViewOp>(
+                               buffer.getDefiningOp()))
+                        buffer = subview.getSource();
+                    if (definedInsideBlock(buffer, frame.newBody))
+                        return false;
+                }
+            }
+            return true;
+        };
+
+        // The task bodies of one level, each guarded by a rank check. Emitted at
         // whatever the current insertion point is.
-        auto emitLevel = [&](const std::vector<TaskOpInfo *> &level) -> LogicalResult
+        auto emitLevelBodies = [&](const std::vector<TaskOpInfo *> &level) -> LogicalResult
         {
             llvm::DenseMap<Value, Value> gpuBufferMap;
-            llvm::SmallVector<Value> toBroadcast;
 
             for (auto task : level)
             {
@@ -780,6 +893,52 @@ struct ConvertScheduleOp : public OpConversionPattern<mlir::dhir::ScheduleOp>
                     ifbuilder.create<mlir::scf::YieldOp>(loc); });
             }
 
+            return success();
+        };
+
+        // The barrier, halo exchange, gather and broadcast of one level.
+        // `hoistedOutOf` is null at the level's own position. When the sync was
+        // deferred it is the body block of the loop it was lifted out of: the
+        // shared mapping still holds that loop's in-flight clones, so every
+        // value the exchange needs is rebuilt here instead of read from it.
+        auto emitLevelSync = [&](const std::vector<TaskOpInfo *> &level,
+                                 Block *hoistedOutOf) -> LogicalResult
+        {
+            llvm::SmallVector<Value> toBroadcast;
+
+            llvm::DenseMap<Value, Value> rematerialized;
+            std::function<Value(Value)> rematerialize = [&](Value value) -> Value {
+                if (!definedInsideBlock(value, hoistedOutOf))
+                    return value;
+                if (Value cached = rematerialized.lookup(value))
+                    return cached;
+                Operation *def = value.getDefiningOp();
+                if (!def || !mlir::isPure(def))
+                    return Value();
+                IRMapping operandMap;
+                for (Value operand : def->getOperands())
+                {
+                    Value outer = rematerialize(operand);
+                    if (!outer)
+                        return Value();
+                    operandMap.map(operand, outer);
+                }
+                Operation *cloned = rewriter.clone(*def, operandMap);
+                for (auto pair : llvm::zip(def->getResults(), cloned->getResults()))
+                    rematerialized[std::get<0>(pair)] = std::get<1>(pair);
+                return rematerialized.lookup(value);
+            };
+
+            // A schedule value in a form that is usable at this insertion
+            // point. Null only when a deferred sync needs something the loop
+            // cannot give up, which the hoist check should already have
+            // refused.
+            auto syncValue = [&](Value original) -> Value {
+                Value mapped = mapping.lookupOrDefault(original);
+                if (!hoistedOutOf)
+                    return mapped;
+                return rematerialize(mapped);
+            };
             rewriter.create<mpi::Barrier>(loc, retVal, comm->getResult(0));
 
             // Communication code
@@ -797,8 +956,8 @@ struct ConvertScheduleOp : public OpConversionPattern<mlir::dhir::ScheduleOp>
                 auto rangeOperands = taskOp.getRangeOperands();
                 if (rangeOperands.size() == 2)
                 {
-                    range.first = mapping.lookupOrDefault(rangeOperands[0]);
-                    range.second = mapping.lookupOrDefault(rangeOperands[1]);
+                    range.first = syncValue(rangeOperands[0]);
+                    range.second = syncValue(rangeOperands[1]);
                 }
                 else
                 {
@@ -933,7 +1092,7 @@ struct ConvertScheduleOp : public OpConversionPattern<mlir::dhir::ScheduleOp>
                             rightTask.getActualBuffer()[output])
                         continue;
 
-                    Value baseBuffer = mapping.lookupOrDefault(
+                    Value baseBuffer = syncValue(
                         leftTask.getActualBuffer()[output]);
                     if (rightHaloLeft > 0)
                     {
@@ -1027,7 +1186,7 @@ struct ConvertScheduleOp : public OpConversionPattern<mlir::dhir::ScheduleOp>
                     // overwrite.
                     if (llvm::is_contained(partialReduceWriteIdx, (int64_t)writeIndex))
                     {
-                        Value actualOut = mapping.lookupOrDefault(
+                        Value actualOut = syncValue(
                             taskOp.getActualBuffer()[writeIndex]);
 
                         Value reduceRootIdx = rewriter.create<arith::ConstantIndexOp>(loc, 0);
@@ -1093,6 +1252,16 @@ struct ConvertScheduleOp : public OpConversionPattern<mlir::dhir::ScheduleOp>
                     }
 
                     auto sourceType = cast<MemRefType>(sourceBuffer.getType());
+                    // The gather addresses this base allocation after the loop
+                    // the sync was lifted out of, so it has to outlive it.
+                    if (hoistedOutOf &&
+                        definedInsideBlock(sourceBuffer, hoistedOutOf))
+                    {
+                        taskOp.emitError("gather base buffer is defined inside "
+                                         "the loop this task's sync was "
+                                         "deferred past");
+                        return failure();
+                    }
                     int64_t sourceRank = sourceType.getRank();
                     int64_t partitionDim = outputPartitionDims[writeIndex];
                     if (partitionDim < 0 || partitionDim >= sourceRank)
@@ -1116,8 +1285,15 @@ struct ConvertScheduleOp : public OpConversionPattern<mlir::dhir::ScheduleOp>
                         // These operands are defined in the schedule body that
                         // is being replaced, so they must be carried through
                         // the value mapping into the emitted function.
-                        Value shardStart = mapping.lookupOrDefault(shardRangeOps[0]);
-                        Value shardEnd = mapping.lookupOrDefault(shardRangeOps[1]);
+                        Value shardStart = syncValue(shardRangeOps[0]);
+                        Value shardEnd = syncValue(shardRangeOps[1]);
+                        if (!shardStart || !shardEnd)
+                        {
+                            taskOp.emitError("shard range cannot be rebuilt "
+                                             "outside the loop this task's sync "
+                                             "was deferred past");
+                            return failure();
+                        }
                         rangeStart = shardStart;
                         Value spanLen = rewriter.create<arith::SubIOp>(
                             loc, shardEnd, shardStart);
@@ -1202,7 +1378,24 @@ struct ConvertScheduleOp : public OpConversionPattern<mlir::dhir::ScheduleOp>
 
             return success();
         };
-
+        
+        // Emit level `levelIdx` here. Its sync follows immediately unless the
+        // level is slab-local across the rebuilt loop we are inside, in which
+        // case the enclosing frame collects it and emits it once after the loop.
+        auto emitLevelOrDefer = [&](size_t levelIdx) -> LogicalResult
+        {
+            const std::vector<TaskOpInfo *> &level =
+                dependencyGraph.levelVector[levelIdx];
+            if (failed(emitLevelBodies(level)))
+                return failure();
+            if (!deferFrames.empty() &&
+                canHoistLevelSync(level, deferFrames.back()))
+            {
+                deferFrames.back().levels.push_back(levelIdx);
+                return success();
+            }
+            return emitLevelSync(level, /*hoistedOutOf=*/nullptr);
+        };
         // Emit a block in program order. Setup operations are ordinary SSA
         // definitions, not a module-wide prologue: moving a pure definition
         // before preceding serial work can change the value seen by a task (and
@@ -1250,8 +1443,7 @@ struct ConvertScheduleOp : public OpConversionPattern<mlir::dhir::ScheduleOp>
                     while (nextLevelToEmit < dependencyGraph.levelVector.size() &&
                            levelTasksRemaining[nextLevelToEmit] == 0) {
                         levelEmitted[nextLevelToEmit] = true;
-                        if (failed(emitLevel(
-                                dependencyGraph.levelVector[nextLevelToEmit])))
+                        if (failed(emitLevelOrDefer(nextLevelToEmit)))
                             return failure();
                         ++nextLevelToEmit;
                     }
@@ -1274,10 +1466,22 @@ struct ConvertScheduleOp : public OpConversionPattern<mlir::dhir::ScheduleOp>
                         SmallVector<Value> initArgs;
                         for (Value init : forOp.getInitArgs())
                             initArgs.push_back(mapping.lookupOrDefault(init));
+                        // Levels emitted inside this loop may owe their sync to
+                        // the point after it. The frame collects them because
+                        // the loop op is not addressable until its builder
+                        // returns.
+                        deferFrames.emplace_back();
+                        deferFrames.back().originalLoop = forOp.getOperation();
+                        // The region builder returns void, so a failure in the
+                        // recursion has to be carried out by hand; dropping it
+                        // left a half-built loop to fail obscurely later.
+                        LogicalResult bodyResult = success();
                         auto newForOp = rewriter.create<mlir::scf::ForOp>(
                             loc, lb, ub, step, initArgs,
                             [&](OpBuilder &bodyBuilder, Location bodyLoc,
                                 Value newIV, ValueRange newIterArgs) {
+                                deferFrames.back().newBody =
+                                    bodyBuilder.getInsertionBlock();
                                 mapping.map(forOp.getInductionVar(), newIV);
                                 for (auto pair : llvm::zip(
                                          forOp.getRegionIterArgs(), newIterArgs))
@@ -1286,7 +1490,10 @@ struct ConvertScheduleOp : public OpConversionPattern<mlir::dhir::ScheduleOp>
                                 rewriter.setInsertionPointToEnd(
                                     bodyBuilder.getInsertionBlock());
                                 if (failed(emitBody(*forOp.getBody())))
+                                {
+                                    bodyResult = failure();
                                     return;
+                                }
 
                                 auto oldYield = cast<mlir::scf::YieldOp>(
                                     forOp.getBody()->getTerminator());
@@ -1300,11 +1507,23 @@ struct ConvertScheduleOp : public OpConversionPattern<mlir::dhir::ScheduleOp>
                                                                      yieldValues);
                             },
                             forOp.getUnsignedCmp());
+                        DeferFrame frame = deferFrames.pop_back_val();
+                        if (failed(bodyResult))
+                            return failure();
                         for (auto pair : llvm::zip(forOp.getResults(),
                                                   newForOp.getResults()))
                             mapping.map(std::get<0>(pair), std::get<1>(pair));
 
                         rewriter.setInsertionPointAfter(newForOp.getOperation());
+                        
+                        // The loop exists now, so the syncs it owes can be
+                        // emitted after it — once each, instead of once per
+                        // iteration.
+                        for (size_t levelIdx : frame.levels)
+                            if (failed(emitLevelSync(
+                                    dependencyGraph.levelVector[levelIdx],
+                                    frame.newBody)))
+                                return failure();
                         continue;
                     }
                     // A loop with no tasks is redundant work that every rank

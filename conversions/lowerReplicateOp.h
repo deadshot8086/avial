@@ -19,6 +19,7 @@
 
 #include "analysis/insoutAnalysis.h"
 #include "analysis/broadcastAnalysis.h"
+#include "analysis/syncHoisting.h"
 
 #include <cmath>
 #include <functional>
@@ -859,6 +860,13 @@ struct ConvertReplicateOp : public OpConversionPattern<mlir::dhir::ReplicateOp>
                 builder.setInsertionPointAfter(forOp);
             };
 
+        // Decided once, before any shard is emitted: the legality walk inspects
+        // the enclosing loop for accesses to the buffer, and a shard body
+        // already lowered into that loop would look like one.
+        mlir::Operation *deferSyncLoop = nullptr;
+        const bool shardIsSlabLocal =
+            mlir::dhir::canDeferSyncOutOfLoop(op, deferSyncLoop);
+
         int64_t current = constlowerBound;
         for (int i = 0; i < num_devices; ++i)
         {
@@ -1016,6 +1024,16 @@ struct ConvertReplicateOp : public OpConversionPattern<mlir::dhir::ReplicateOp>
                     needBroadcast = true;
             }
 
+            // A shard in a serial loop is synced every iteration in case it
+            // feeds the next one.  When every access stays in this rank's own
+            // slab that is redundant, so mark the task and let dhir-to-mpi
+            // emit one sync after the loop instead.
+            bool deferSync = needBroadcast && shardIsSlabLocal;
+            if (deferSync && i == 0)
+                llvm::errs() << "Shard is slab-local across its enclosing serial "
+                                "loop; deferring sync until after the loop\n";
+
+
             // Runtime shards carry their [start, end) range as operands so the
             // gather/scatter extent can be sliced dynamically downstream; the
             // compile-time attributes remain authoritative for the static path
@@ -1041,6 +1059,10 @@ struct ConvertReplicateOp : public OpConversionPattern<mlir::dhir::ReplicateOp>
             taskOp->setAttr("name", rewriter.getStringAttr(std::to_string(i)));
             taskOp->setAttr("needBroadcast", rewriter.getBoolAttr(needBroadcast));
 
+            // dhir-to-mpi still has the last word: it emits the sync inline
+            // anyway if the values the gather needs cannot leave the loop.
+            if (deferSync)
+                taskOp->setAttr("deferSync", rewriter.getUnitAttr());
             mlir::IntegerAttr repIdAttr;
             if (auto attr = op->getAttrOfType<mlir::IntegerAttr>("replicateID"))
                 repIdAttr = attr;
