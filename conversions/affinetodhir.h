@@ -193,7 +193,7 @@ namespace mlir
                 });
                 return scaled;
             }
-            
+
             bool isStencilLoop(Operation *loop, Value iv,
                                const llvm::SmallVector<llvm::SmallVector<Value>> &insouts)
             {
@@ -513,12 +513,15 @@ namespace mlir
                                     else
                                         toReplicateVector.push_back(forOp);
                                 }
-                                else // outerDep == 2, dependence check failed
+                                else // outerDep == 2, dependence check inconclusive
                                 {
-                                    // [TODO] Consider it as an Individual task and wrap everything 
-                                    // with task Op. 
-                                    llvm::errs() << "Dependence Analysis Failed!\n";
-                                    exit(0);    
+                                    // Dependence test inconclusive (e.g. lbm's
+                                    // cross-iteration dependence).  This used to
+                                    // exit(0), leaving an empty kernel object;
+                                    // instead leave the loop unwrapped so it
+                                    // runs unchanged (correct, no speedup).
+                                    llvm::errs() << "Dependence analysis inconclusive; "
+                                                    "leaving it unpartitioned\n";
                                 }
                             }
                         }

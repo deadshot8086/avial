@@ -57,7 +57,7 @@ compiler — MPI calls are emitted by `--dhir-to-mpi`, and the DHIR runtime/Open
 ```bash
 ./tests/rodinia/run_dhir.sh nw 2
 ./tests/rodinia/run_dhir.sh all 4
-# overrides: DHIR_OPT=... CONFIG=... RUNTIME=... MLIR_OPT=... DHIR_MPIRUN_FLAGS=...
+# overrides: DHIR_OPT=... CONFIG=... RUNTIME=... MLIR_TRANSLATE=... LLC=... DHIR_MPIRUN_FLAGS=...
 # DHIR_OMP_LIBDIR=... env vars; same --keep / --verbose / --workdir options as test.sh
 ```
 

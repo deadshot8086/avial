@@ -81,12 +81,18 @@ namespace mlir
                     llvm::errs() << "  Found " << subsequentReplicates.size() 
                                 << " subsequent replicate(s)\n";
 
-                    // A consumer's partitioning strategy does not prove the
-                    // producer used the same shard ranges or axis, so keeping
-                    // the producer distributed is unsound: materialize its
-                    // assembled output for every subsequent consumer.  A
-                    // contract-aware analysis can relax this later.
+                    // Consumer partitioning alone doesn't prove the producer's
+                    // shard ranges/axis/bounds match, so the default is to
+                    // materialize the producer's output.  Only skip the transfer
+                    // when every consumer reads exactly the slab the producer
+                    // wrote (shardContractMatches); anything unknown falls back
+                    // to broadcast.
+                    ArrayPartitioningInfo producerInfo =
+                        analyzeArrayForPartitioning(replicateOp, writeArg);
+                    LoopBounds producerBounds = partitionedLoopBounds(replicateOp);
+
                     bool needsAnyBroadcast = !subsequentReplicates.empty();
+                    bool allContractsMatch = !subsequentReplicates.empty();
                     ArrayPartitioningInfo firstPartInfo{};
                     bool havePartInfo = false;
                     for (mlir::Operation *nextReplicate : subsequentReplicates)
@@ -99,11 +105,20 @@ namespace mlir
                             havePartInfo = true;
                         }
                         needsAnyBroadcast |= needsBroadcast(partInfo);
+                        allContractsMatch &= shardContractMatches(
+                            producerInfo, partInfo, producerBounds,
+                            partitionedLoopBounds(nextReplicate));
                     }
 
                     info.partInfo = firstPartInfo;
 
-                    if (needsAnyBroadcast) {
+                    if (needsAnyBroadcast && allContractsMatch) {
+                        info.needsBroadcast = false;
+                        info.reason =
+                            "every consumer reads exactly this producer's shard "
+                            "(same axis, no halo, identical bounds)";
+                        llvm::errs() << "  ✗ NO BROADCAST: " << info.reason << "\n";
+                    } else if (needsAnyBroadcast) {
                         info.needsBroadcast = true;
                         info.reason = "producer/consumer shard contract is not proven; materialize output";
                         llvm::errs() << "  ✓ BROADCAST NEEDED: " << info.reason << "\n";
@@ -198,6 +213,76 @@ namespace mlir
                 // If the subsequent replicate needs NO_PARTITION (replicate strategy),
                 // then we need to broadcast the data so all nodes get the processed data
                 return partInfo.strategy == ArrayPartitioningInfo::NO_PARTITION;
+            }
+
+            // Bounds of the loop a replicate partitions.  Shard slabs come from
+            // deterministically splitting this [lb, ub), so equal bounds imply
+            // equal shard ranges on every rank.
+            struct LoopBounds
+            {
+                bool known = false;
+                Value lb, ub, step;
+            };
+
+            LoopBounds partitionedLoopBounds(mlir::Operation *replicate)
+            {
+                LoopBounds bounds;
+                // The partitioned loop is the first loop in the replicate body,
+                // matching how analyzeArrayForPartitioning picks the IV.
+                replicate->walk<mlir::WalkOrder::PreOrder>([&](mlir::Operation *child) {
+                    if (bounds.known)
+                        return mlir::WalkResult::interrupt();
+                    if (auto scfFor = mlir::dyn_cast<mlir::scf::ForOp>(child)) {
+                        bounds.known = true;
+                        bounds.lb = scfFor.getLowerBound();
+                        bounds.ub = scfFor.getUpperBound();
+                        bounds.step = scfFor.getStep();
+                        return mlir::WalkResult::interrupt();
+                    }
+                    return mlir::WalkResult::advance();
+                });
+                return bounds;
+            }
+
+            // Two values are provably the same extent: identical SSA value, or
+            // two constants of equal value.  Anything else is treated as unknown.
+            static bool sameExtent(Value a, Value b)
+            {
+                if (!a || !b)
+                    return false;
+                if (a == b)
+                    return true;
+                mlir::IntegerAttr ca, cb;
+                if (mlir::matchPattern(a, mlir::m_Constant(&ca)) &&
+                    mlir::matchPattern(b, mlir::m_Constant(&cb)))
+                    return ca.getValue() == cb.getValue();
+                return false;
+            }
+
+            // True when the producer's shard is exactly the slab each consumer
+            // reads: both partition the buffer, same axis, no halo, provably
+            // identical loop bounds.  Anything unknown returns false (broadcast).
+            bool shardContractMatches(const ArrayPartitioningInfo &producerInfo,
+                                      const ArrayPartitioningInfo &consumerInfo,
+                                      const LoopBounds &producerBounds,
+                                      const LoopBounds &consumerBounds)
+            {
+                if (producerInfo.strategy == ArrayPartitioningInfo::NO_PARTITION ||
+                    consumerInfo.strategy == ArrayPartitioningInfo::NO_PARTITION)
+                    return false;
+                if (producerInfo.strategy != consumerInfo.strategy)
+                    return false;
+                if (producerInfo.partitionDimension < 0 ||
+                    producerInfo.partitionDimension != consumerInfo.partitionDimension)
+                    return false;
+                if (producerInfo.haloLeft || producerInfo.haloRight ||
+                    consumerInfo.haloLeft || consumerInfo.haloRight)
+                    return false;
+                if (!producerBounds.known || !consumerBounds.known)
+                    return false;
+                return sameExtent(producerBounds.lb, consumerBounds.lb) &&
+                       sameExtent(producerBounds.ub, consumerBounds.ub) &&
+                       sameExtent(producerBounds.step, consumerBounds.step);
             }
         };
 

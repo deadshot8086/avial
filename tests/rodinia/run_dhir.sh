@@ -2,10 +2,10 @@
 #
 # Build and run Rodinia kernel driver at given rank
 #
-#   vendor/rodinia/extracted_mlir/test.sh <kernel|all> [ranks] [options]
+#   tests/rodinia/run_dhir.sh <kernel|all> [ranks] [options]
 #
-# Pipeline (STRICTLY mlir-opt, NEVER dhir-opt):
-#   mlir-opt       -> LLVM dialect
+# Pipeline (dhir-opt path — the DHIR compiler; test.sh is the mlir-opt baseline):
+#   dhir-opt       -> LLVM dialect
 #   mlir-translate -> .ll
 #   llc            -> kernel.o
 #   gcc/g++        -> ref_<kernel>.o (compiled reference object)
@@ -22,7 +22,6 @@ DHIR_OPT="${DHIR_OPT:-$ROOT/build/bin/dhir-opt}"
 CONFIG="${CONFIG:-$ROOT/tests/configs/system_config_4_cpu.json}"
 RUNTIME="${RUNTIME:-$ROOT/build/libdhir_runtime.a}"
 OMP_LIBDIR="${DHIR_OMP_LIBDIR:-/usr/local/lib/x86_64-unknown-linux-gnu}"
-MLIR_OPT="${MLIR_OPT:-$HOME/.local/bin/mlir-opt}"
 MLIR_TRANSLATE="${MLIR_TRANSLATE:-$HOME/.local/bin/mlir-translate}"
 LLC="${LLC:-$HOME/.local/bin/llc}"
 

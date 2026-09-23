@@ -28,6 +28,8 @@ void ref_mri_gridding(int n, int size_x, int size_y, int size_z,
                       float *gridData, float *sampleDensity);
 }
 
+#include <string>
+
 #define MG_PI 3.14159265359
 
 static int numSamples = 2655910;

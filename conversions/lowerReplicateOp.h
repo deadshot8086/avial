@@ -997,7 +997,18 @@ struct ConvertReplicateOp : public OpConversionPattern<mlir::dhir::ReplicateOp>
                 {
                     subViewOuts.push_back(out);
                     mapping.map(out, out);
-                    outputPartitionDims.push_back(0);
+                    // No local subview for this output: either replicated, or
+                    // slicing was disabled (forceAbsoluteBounds) while the
+                    // iteration is still sharded on the analyzed axis.  Using
+                    // dim 0 there reassembles the wrong axis — heap corruption
+                    // when it's larger (leukocyte np=4 crash).  Use the analyzed
+                    // dim when real (>=0), else 0 for replicated outputs.
+                    if (forceAbsoluteBounds &&
+                        partitionInfo.partitionDimension >= 0)
+                        outputPartitionDims.push_back(
+                            partitionInfo.partitionDimension);
+                    else
+                        outputPartitionDims.push_back(0);
                 }
 
                 if (op->hasAttr("forceBroadcast") ||
