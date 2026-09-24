@@ -34,7 +34,7 @@ static FILE *open_dataset(const char *path) {
     FILE *fp = fopen(path, "rb");
     if (fp) return fp;
     char buf[1024];
-    snprintf(buf, sizeof(buf), "vendor/parboil/datasets/stencil/small/input/%s", path);
+    snprintf(buf, sizeof(buf), "vendor/parboil/datasets/stencil/default/input/%s", path);
     fp = fopen(buf, "rb");
     return fp;
 }
@@ -55,7 +55,7 @@ static bool read_description_params(const char *dataset_path, char *buf, size_t 
 
     FILE *fp = fopen(desc_path, "r");
     if (!fp) {
-        snprintf(desc_path, sizeof(desc_path), "vendor/parboil/datasets/stencil/small/input/DESCRIPTION");
+        snprintf(desc_path, sizeof(desc_path), "vendor/parboil/datasets/stencil/default/input/DESCRIPTION");
         fp = fopen(desc_path, "r");
     }
     if (!fp) return false;
@@ -87,7 +87,7 @@ static void synth_fill(float *p, long n) {
 
 static void bench_alloc(void) {
     const char *input = getenv("STENCIL_INPUT");
-    if (!input) input = "vendor/parboil/datasets/stencil/small/input/128x128x32.bin";
+    if (!input) input = "vendor/parboil/datasets/stencil/default/input/512x512x64x100.bin";
 
     char params[256] = {0};
     if (read_description_params(input, params, sizeof(params))) {

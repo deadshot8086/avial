@@ -142,7 +142,8 @@ say "dhir-opt"
     exit 1
 }
 
-sed -i "s/, $MPI_SPEC//g; s/$MPI_SPEC//g" "$WORKDIR/llvm.mlir"
+sed "s/, $MPI_SPEC//g; s/$MPI_SPEC//g" "$WORKDIR/llvm.mlir" > "$WORKDIR/llvm.clean.mlir"
+mv "$WORKDIR/llvm.clean.mlir" "$WORKDIR/llvm.mlir"
 
 say "mlir-translate"
 mlir-translate --mlir-to-llvmir "$WORKDIR/llvm.mlir" > "$WORKDIR/kernel.ll" 2> "$WORKDIR/translate.log" || {
@@ -151,9 +152,9 @@ mlir-translate --mlir-to-llvmir "$WORKDIR/llvm.mlir" > "$WORKDIR/kernel.ll" 2> "
     exit 1
 }
 
-# Use driver
-sed -i 's/@MPI_Init\b/@dhir_noop_mpi_init/g; s/@MPI_Finalize\b/@dhir_noop_mpi_finalize/g' \
-    "$WORKDIR/kernel.ll"
+sed 's/@MPI_Init\b/@dhir_noop_mpi_init/g; s/@MPI_Finalize\b/@dhir_noop_mpi_finalize/g' \
+    "$WORKDIR/kernel.ll" > "$WORKDIR/kernel.driver.ll"
+mv "$WORKDIR/kernel.driver.ll" "$WORKDIR/kernel.ll"
 
 say "llc"
 llc -O3 -relocation-model=pic -filetype=obj "$WORKDIR/kernel.ll" -o "$WORKDIR/kernel.o" \

@@ -32,7 +32,7 @@ static FILE *open_resolved(const char *path) {
     FILE *fp = fopen(path, "r");
     if (fp) return fp;
 
-    std::string p1 = std::string("vendor/parboil/datasets/sgemm/small/input/") + path;
+    std::string p1 = std::string("vendor/parboil/datasets/sgemm/medium/input/") + path;
     fp = fopen(p1.c_str(), "r");
     return fp;
 }

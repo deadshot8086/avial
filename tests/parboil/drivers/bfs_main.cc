@@ -39,7 +39,7 @@ static FILE *open_resolved(const char *path) {
     FILE *fp = fopen(path, "r");
     if (fp) return fp;
 
-    std::string p1 = std::string("vendor/parboil/datasets/bfs/UT/input/") + path;
+    std::string p1 = std::string("vendor/parboil/datasets/bfs/NY/input/") + path;
     return fopen(p1.c_str(), "r");
 }
 
@@ -137,7 +137,7 @@ static void synth_graph(void) {
 
 static void bench_alloc(void) {
     const char *input = getenv("BFS_INPUT");
-    if (!input) input = "vendor/parboil/datasets/bfs/UT/input/graph_input.dat";
+    if (!input) input = "vendor/parboil/datasets/bfs/NY/input/graph_input.dat";
 
     bool real_data = read_dataset(input);
     if (!real_data) synth_graph();

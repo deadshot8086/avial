@@ -65,7 +65,7 @@ static FILE *open_resolved(const char *path, const char *mode) {
     FILE *fp = fopen(path, mode);
     if (fp) return fp;
 
-    std::string p1 = std::string("vendor/parboil/datasets/spmv/small/input/") + path;
+    std::string p1 = std::string("vendor/parboil/datasets/spmv/medium/input/") + path;
     fp = fopen(p1.c_str(), mode);
     if (fp) return fp;
 
@@ -260,9 +260,9 @@ static void read_description_params(const char *mfile) {
 
 static void bench_alloc(void) {
     const char *mfile = getenv("SPMV_INPUT");
-    if (!mfile) mfile = "vendor/parboil/datasets/spmv/small/input/1138_bus.mtx";
+    if (!mfile) mfile = "vendor/parboil/datasets/spmv/medium/input/bcsstk18.mtx";
     const char *vfile = getenv("SPMV_VECTOR");
-    if (!vfile) vfile = "vendor/parboil/datasets/spmv/small/input/vector.bin";
+    if (!vfile) vfile = "vendor/parboil/datasets/spmv/medium/input/vector.bin";
 
     read_description_params(mfile);
 

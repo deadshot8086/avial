@@ -52,7 +52,7 @@ static void resolve_input_dir(void) {
         size_t slash = s.find_last_of('/');
         if (slash != std::string::npos) candidates[n++] = s.substr(0, slash);
     }
-    candidates[n++] = "vendor/parboil/datasets/tpacf/small/input";
+    candidates[n++] = "vendor/parboil/datasets/tpacf/medium/input";
 
     for (int i = 0; i < n; ++i) {
         std::string probe = candidates[i] + "/Datapnts.1";

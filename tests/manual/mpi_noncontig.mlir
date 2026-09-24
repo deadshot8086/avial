@@ -1,10 +1,6 @@
-// Guard test: the raw-pointer + element-count encoding used
-// by MPIToLLVM only describes a *contiguous* run of memory.
-//
 // @noncontig takes a column slice: strides [8,1] over dims [8,2], so the outer
 // stride (8) exceeds the inner extent (2) and the rows are not adjacent.
-// Lowering it to MPI_Send(ptr, count=16) would transfer 16 contiguous floats,
-// which is not this buffer. --lower-to-llvm must refuse it.
+// --lower-to-llvm must describe it with an MPI derived datatype.
 //
 // @contig takes a row slice of the same array: strides [8,1] over dims [2,8],
 // which is contiguous, and must lower without complaint.

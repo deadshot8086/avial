@@ -64,7 +64,7 @@ SPECS = {
                  ("A", ["N", "N"])]),
 
     # tmp = A*x ; y = A^T*tmp
-    "atax": Spec("kernel_atax", ["M", "N", "M"],
+    "atax": Spec("kernel_atax", ["M", "N", "N"],
                  [("A", ["M", "N"]), ("x", ["N"]), ("y", ["N"]), ("tmp", ["M"])]),
 
     # T sweeps of a 1-D 3-point stencil over [1, N-1). Both arrays are fully
